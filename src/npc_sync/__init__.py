@@ -7,7 +7,7 @@ import importlib.metadata
 import logging
 
 # import functions from submodules here:
-# from npc_sync.utils import *
+from npc_sync.sync import *
 
 logger = logging.getLogger(__name__)
 
