@@ -14,8 +14,7 @@ on:
 
 
 concurrency:
-  group: {% raw %}${{ github.ref }}{% endraw %}
-
+  group: ${{ github.ref }}
 
 jobs:
   build-doc:
