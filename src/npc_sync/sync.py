@@ -56,8 +56,8 @@ def get_single_sync_path(dir_or_paths: npc_io.PathLike | Iterable[npc_io.PathLik
         if (d := npc_io.from_pathlike(dir_or_paths)).is_dir():
             dir_or_paths = d.iterdir()
         else:
-            dir_or_paths = tuple(dir_or_paths)
-            
+            dir_or_paths = [dir_or_paths]
+
     if date is not None:
         try:
             date = npc_session.DatetimeRecord(date)
@@ -65,15 +65,16 @@ def get_single_sync_path(dir_or_paths: npc_io.PathLike | Iterable[npc_io.PathLik
             date = npc_session.DateRecord(date)
             
     sync_files = []
-    for p in (npc_io.from_pathlike(p) for p in dir_or_paths):
+    all_paths: list[upath.UPath] = [npc_io.from_pathlike(p) for p in dir_or_paths] # type: ignore[arg-type, union-attr]
+    for p in all_paths:
         if p.suffix not in (".sync", ".h5"):
             continue
         if date is not None:
             try:
                 if isinstance(date, npc_session.DatetimeRecord):
-                    file_date = npc_session.DatetimeRecord(file_date)
+                    file_date: npc_session.DatetimeRecord | npc_session.DateRecord = npc_session.DatetimeRecord(p.stem)
                 else:
-                    file_date = npc_session.DateRecord(file_date)
+                    file_date = npc_session.DateRecord(p.stem)
             except ValueError:
                 continue
             if file_date != date:
