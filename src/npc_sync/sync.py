@@ -13,7 +13,7 @@ import datetime
 import io
 import logging
 from collections.abc import Iterable, Sequence
-from typing import TYPE_CHECKING, Any, ClassVar, Literal, Union
+from typing import TYPE_CHECKING, Any, Literal, Union
 
 import h5py
 import npc_io
@@ -109,14 +109,14 @@ class SyncDataset:
         return f"{self.__class__.__name__}({self.dfile.filename})"
 
     def validate(
-        self, 
-        camstim: bool = True, 
+        self,
+        camstim: bool = True,
         mvr: bool = True,
-        barcodes: bool = True, 
-        licks: bool = True, 
-        opto: bool = False, 
+        barcodes: bool = True,
+        licks: bool = True,
+        opto: bool = False,
         audio: bool = False,
-        ) -> None:
+    ) -> None:
         """
         Check all lines are present and have events.
 
@@ -125,12 +125,18 @@ class SyncDataset:
         """
         if not self.line_labels:
             raise AssertionError("Sync file has no line labels.")
-        
+
         lines: list[str | int] = []
         if camstim:
             lines.extend(["vsync_stim", "stim_photodiode", "stim_running"])
         if mvr:
-            lines.extend([f"{cam}_cam_{suffix}" for cam in ("beh", "eye", "face") for suffix in ("frame_readout", "exposing")])
+            lines.extend(
+                [
+                    f"{cam}_cam_{suffix}"
+                    for cam in ("beh", "eye", "face")
+                    for suffix in ("frame_readout", "exposing")
+                ]
+            )
         if barcodes:
             lines.append("barcode_ephys")
         if licks:
@@ -139,14 +145,14 @@ class SyncDataset:
             lines.append(self.get_line_for_stim_onset("opto"))
         if audio and self.start_time.date() >= FIRST_SOUND_ON_SYNC_DATE:
             lines.append(self.get_line_for_stim_onset("audio"))
-            
+
         for line in lines:
             self._check_line(line)
-            
+
         if camstim:
             self._check_camstim_lines()
         logger.info(f"Sync file passed validation for {lines = }")
-        
+
     def _check_line(self, label_or_index: str | int) -> None:
         """Verify line is present and has events, or raise AssertionError."""
         try:
@@ -159,7 +165,7 @@ class SyncDataset:
     def _check_camstim_lines(self) -> None:
         self._check_stim_photodiode()
         self._check_vsyncs()
-        
+
     def _check_stim_photodiode(self) -> None:
         try:
             _ = self.expected_diode_flip_rate
