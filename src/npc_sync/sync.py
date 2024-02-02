@@ -20,8 +20,8 @@ import npc_io
 import npc_session
 import numpy as np
 import numpy.typing as npt
-from typing_extensions import Self, TypeAlias
 import upath
+from typing_extensions import Self, TypeAlias
 
 if TYPE_CHECKING:
     import matplotlib.axes
@@ -43,10 +43,21 @@ def get_sync_data(sync_path_or_data: SyncPathOrDataset) -> SyncDataset:
         return sync_path_or_data
     return SyncDataset(sync_path_or_data)
 
-def get_single_sync_path(dir_or_paths: npc_io.PathLike | Iterable[npc_io.PathLike], date: str | datetime.date | datetime.datetime | npc_session.DateRecord | npc_session.DatetimeRecord | None = None) -> upath.UPath:
+
+def get_single_sync_path(
+    dir_or_paths: npc_io.PathLike | Iterable[npc_io.PathLike],
+    date: (
+        str
+        | datetime.date
+        | datetime.datetime
+        | npc_session.DateRecord
+        | npc_session.DatetimeRecord
+        | None
+    ) = None,
+) -> upath.UPath:
     """From an iterable of paths, return the one with the expected date and a
     .sync or .h5 extension.
-    
+
     >>> get_single_sync_path('s3://aind-ephys-data/ecephys_676909_2023-12-14_12-43-11/behavior_videos')
     S3Path('s3://aind-ephys-data/ecephys_676909_2023-12-14_12-43-11/behavior_videos/20231214T124311.h5')
     """
@@ -63,16 +74,18 @@ def get_single_sync_path(dir_or_paths: npc_io.PathLike | Iterable[npc_io.PathLik
             date = npc_session.DatetimeRecord(date)
         except ValueError:
             date = npc_session.DateRecord(date)
-            
+
     sync_files = []
-    all_paths: list[upath.UPath] = [npc_io.from_pathlike(p) for p in dir_or_paths] # type: ignore[arg-type, union-attr]
+    all_paths: list[upath.UPath] = [npc_io.from_pathlike(p) for p in dir_or_paths]  # type: ignore[arg-type, union-attr]
     for p in all_paths:
         if p.suffix not in (".sync", ".h5"):
             continue
         if date is not None:
             try:
                 if isinstance(date, npc_session.DatetimeRecord):
-                    file_date: npc_session.DatetimeRecord | npc_session.DateRecord = npc_session.DatetimeRecord(p.stem)
+                    file_date: npc_session.DatetimeRecord | npc_session.DateRecord = (
+                        npc_session.DatetimeRecord(p.stem)
+                    )
                 else:
                     file_date = npc_session.DateRecord(p.stem)
             except ValueError:
@@ -80,10 +93,11 @@ def get_single_sync_path(dir_or_paths: npc_io.PathLike | Iterable[npc_io.PathLik
             if file_date != date:
                 continue
         sync_files.append(p)
-                        
+
     if not len(sync_files) == 1:
         raise ValueError(f"Expected 1 sync file, found {sync_files = }")
     return sync_files[0]
+
 
 def get_bit(uint_array: npt.NDArray, bit: int) -> npt.NDArray[np.uint8]:
     """
