@@ -99,19 +99,6 @@ class SyncDataset:
 
     """
 
-    required_lines: ClassVar[list[str | int]] = [
-        "barcode_ephys",
-        "vsync_stim",
-        "stim_photodiode",
-        "stim_running",
-        *[
-            f"{cam}_cam_{suffix}"
-            for cam in ("beh", "eye", "face")
-            for suffix in ("frame_readout", "exposing")
-        ],
-        "lick_sensor",
-    ]
-
     def __init__(self, path) -> None:
         if isinstance(path, self.__class__):
             self = path
@@ -121,30 +108,47 @@ class SyncDataset:
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}({self.dfile.filename})"
 
-    def validate(self, opto: bool = False, audio: bool = False) -> None:
+    def validate(
+        self, 
+        camstim: bool = True, 
+        mvr: bool = True,
+        barcodes: bool = True, 
+        licks: bool = True, 
+        opto: bool = False, 
+        audio: bool = False,
+        ) -> None:
         """
-        Check all members of `self.required_lines` are present and have events.
-        Check vsync and photodiode events can be interpreted to deduce stim blocks.
+        Check all lines are present and have events.
 
         - if opto or audio are True, work out which line indices correspond and
           check those too
         """
-        self._check_line_labels(opto=opto, audio=audio)
-        self._check_stim_photodiode()
-        self._check_vsyncs()
-
-    def _check_line_labels(self, opto: bool = False, audio: bool = False) -> None:
-        if not hasattr(self, "line_labels"):
+        if not self.line_labels:
             raise AssertionError("Sync file has no line labels.")
-        lines = self.required_lines
+        
+        lines: list[str | int] = []
+        if camstim:
+            lines.extend(["vsync_stim", "stim_photodiode", "stim_running"])
+        if mvr:
+            lines.extend([f"{cam}_cam_{suffix}" for cam in ("beh", "eye", "face") for suffix in ("frame_readout", "exposing")])
+        if barcodes:
+            lines.append("barcode_ephys")
+        if licks:
+            lines.append("lick_sensor")
         if opto:
             lines.append(self.get_line_for_stim_onset("opto"))
         if audio and self.start_time.date() >= FIRST_SOUND_ON_SYNC_DATE:
             lines.append(self.get_line_for_stim_onset("audio"))
+            
         for line in lines:
             self._check_line(line)
-
+            
+        if camstim:
+            self._check_camstim_lines()
+        logger.info(f"Sync file passed validation for {lines = }")
+        
     def _check_line(self, label_or_index: str | int) -> None:
+        """Verify line is present and has events, or raise AssertionError."""
         try:
             stats = self.line_stats(label_or_index)
         except IndexError:
@@ -152,6 +156,10 @@ class SyncDataset:
         if stats is None:
             raise AssertionError(f"Sync file has no events on line {label_or_index}")
 
+    def _check_camstim_lines(self) -> None:
+        self._check_stim_photodiode()
+        self._check_vsyncs()
+        
     def _check_stim_photodiode(self) -> None:
         try:
             _ = self.expected_diode_flip_rate
