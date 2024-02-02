@@ -5,7 +5,7 @@
 groups = ["default", "dev", "docs"]
 strategy = ["cross_platform", "inherit_metadata"]
 lock_version = "4.4.1"
-content_hash = "sha256:fa87f418fef904a0578d2e594c465918916d07bcf9ddf154213e6897c268f627"
+content_hash = "sha256:bd99883dcd4fb17c0fdbaa5a345151637d5e16717da1c12ec72bde00a525d03c"
 
 [[package]]
 name = "aiobotocore"
@@ -1509,6 +1509,20 @@ dependencies = [
 files = [
     {file = "npc-io-0.1.20.tar.gz", hash = "sha256:5f4e6d0a96009ca464f29e84b80266143e5414e9002af65bf70eb231bdc0006a"},
     {file = "npc_io-0.1.20-py3-none-any.whl", hash = "sha256:2d773ab0cc155f8f3a30d5b22c5223c5e054e4d3c73fc779b873d721e8b4c141"},
+]
+
+[[package]]
+name = "npc-session"
+version = "0.1.33"
+requires_python = ">=3.9"
+summary = "Basic tools for parsing subject, session, date and time associated with data from the Mindscope Neuropixels team, in the cloud."
+groups = ["default"]
+dependencies = [
+    "typing-extensions>=4.7.1",
+]
+files = [
+    {file = "npc_session-0.1.33-py3-none-any.whl", hash = "sha256:a26a2dfc5f88b5f0b0c5ef76fe6a7dbaa63c0eea2df8c7390e74e5e5d3364d6e"},
+    {file = "npc_session-0.1.33.tar.gz", hash = "sha256:3f008c58e0f4a9b6ed76b413b91e8525e5ff6a0e8c9cc3960ab9e893443b8d52"},
 ]
 
 [[package]]

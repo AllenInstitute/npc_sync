@@ -17,9 +17,11 @@ from typing import TYPE_CHECKING, Any, Literal, Union
 
 import h5py
 import npc_io
+import npc_session
 import numpy as np
 import numpy.typing as npt
 from typing_extensions import Self, TypeAlias
+import upath
 
 if TYPE_CHECKING:
     import matplotlib.axes
@@ -41,6 +43,46 @@ def get_sync_data(sync_path_or_data: SyncPathOrDataset) -> SyncDataset:
         return sync_path_or_data
     return SyncDataset(sync_path_or_data)
 
+def get_single_sync_path(dir_or_paths: npc_io.PathLike | Iterable[npc_io.PathLike], date: str | datetime.date | datetime.datetime | npc_session.DateRecord | npc_session.DatetimeRecord | None = None) -> upath.UPath:
+    """From an iterable of paths, return the one with the expected date and a
+    .sync or .h5 extension.
+    
+    >>> get_single_sync_path('s3://aind-ephys-data/ecephys_676909_2023-12-14_12-43-11/behavior_videos')
+    S3Path('s3://aind-ephys-data/ecephys_676909_2023-12-14_12-43-11/behavior_videos/20231214T124311.h5')
+    """
+    if isinstance(dir_or_paths, str):
+        dir_or_paths = npc_io.from_pathlike(dir_or_paths)
+    if not isinstance(dir_or_paths, Iterable):
+        if (d := npc_io.from_pathlike(dir_or_paths)).is_dir():
+            dir_or_paths = d.iterdir()
+        else:
+            dir_or_paths = tuple(dir_or_paths)
+            
+    if date is not None:
+        try:
+            date = npc_session.DatetimeRecord(date)
+        except ValueError:
+            date = npc_session.DateRecord(date)
+            
+    sync_files = []
+    for p in (npc_io.from_pathlike(p) for p in dir_or_paths):
+        if p.suffix not in (".sync", ".h5"):
+            continue
+        if date is not None:
+            try:
+                if isinstance(date, npc_session.DatetimeRecord):
+                    file_date = npc_session.DatetimeRecord(file_date)
+                else:
+                    file_date = npc_session.DateRecord(file_date)
+            except ValueError:
+                continue
+            if file_date != date:
+                continue
+        sync_files.append(p)
+                        
+    if not len(sync_files) == 1:
+        raise ValueError(f"Expected 1 sync file, found {sync_files = }")
+    return sync_files[0]
 
 def get_bit(uint_array: npt.NDArray, bit: int) -> npt.NDArray[np.uint8]:
     """

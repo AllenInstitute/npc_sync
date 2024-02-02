@@ -12,6 +12,7 @@ dependencies = [
     "matplotlib>=3.8.2",
     "typing-extensions>=4.9.0",
     "npc-io>=0.1.20",
+    "npc-session>=0.1.33",
 ]
 version = "0.1.4"
 classifiers = [
