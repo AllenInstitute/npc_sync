@@ -34,6 +34,7 @@ FIRST_SOUND_ON_SYNC_DATE = datetime.date(2023, 8, 31)
 """Prior to this date, there's no sync line with "sound running" signal, on any rig: need to
 use NI-DAQ analog recording on OpenEphys PXI to get sound onset times."""
 
+
 def get_sync_data(sync_path_or_data: SyncPathOrDataset) -> SyncDataset:
     """Open a path or file-like object and return a SyncDataset object."""
     if isinstance(sync_path_or_data, SyncDataset):
@@ -86,7 +87,7 @@ class SyncDataset:
     --------
     >>> dset = SyncDataset('s3://aind-ephys-data/ecephys_676909_2023-12-14_12-43-11/behavior_videos/20231214T124311.h5')
     >>> dset.validate(opto=True, audio=True)
-    
+
     >>> with SyncDataset('my_h5_file.h5') as d: # doctest: +SKIP
     ...     dset.validate()
 
@@ -97,12 +98,17 @@ class SyncDataset:
 
 
     """
+
     required_lines: ClassVar[list[str | int]] = [
-        "barcode_ephys", 
-        "vsync_stim", 
-        "stim_photodiode", 
-        "stim_running", 
-        *[f"{cam}_cam_{suffix}" for cam in ("beh", "eye", "face") for suffix in ("frame_readout", "exposing")],
+        "barcode_ephys",
+        "vsync_stim",
+        "stim_photodiode",
+        "stim_running",
+        *[
+            f"{cam}_cam_{suffix}"
+            for cam in ("beh", "eye", "face")
+            for suffix in ("frame_readout", "exposing")
+        ],
         "lick_sensor",
     ]
 
@@ -119,14 +125,14 @@ class SyncDataset:
         """
         Check all members of `self.required_lines` are present and have events.
         Check vsync and photodiode events can be interpreted to deduce stim blocks.
-        
+
         - if opto or audio are True, work out which line indices correspond and
           check those too
         """
         self._check_line_labels(opto=opto, audio=audio)
         self._check_stim_photodiode()
         self._check_vsyncs()
-        
+
     def _check_line_labels(self, opto: bool = False, audio: bool = False) -> None:
         if not hasattr(self, "line_labels"):
             raise AssertionError("Sync file has no line labels.")
@@ -137,7 +143,7 @@ class SyncDataset:
             lines.append(self.get_line_for_stim_onset("audio"))
         for line in lines:
             self._check_line(line)
-                
+
     def _check_line(self, label_or_index: str | int) -> None:
         try:
             stats = self.line_stats(label_or_index)
@@ -145,18 +151,22 @@ class SyncDataset:
             raise AssertionError(f"Sync file has no line {label_or_index}")
         if stats is None:
             raise AssertionError(f"Sync file has no events on line {label_or_index}")
-            
+
     def _check_stim_photodiode(self) -> None:
         try:
             _ = self.expected_diode_flip_rate
         except ValueError as exc:
-            raise AssertionError("Frame rate estimated from diode flips is abnormal.") from exc
+            raise AssertionError(
+                "Frame rate estimated from diode flips is abnormal."
+            ) from exc
 
     def _check_vsyncs(self) -> None:
         try:
             _ = self.vsync_times_in_blocks
         except ValueError as exc:
-            raise AssertionError("vsyncs should be divisible into blocks corresponding to individual stims presented, but they appear abnormal.") from exc
+            raise AssertionError(
+                "vsyncs should be divisible into blocks corresponding to individual stims presented, but they appear abnormal."
+            ) from exc
 
     def _process_times(self) -> npt.NDArray[np.int64]:
         """
@@ -197,10 +207,14 @@ class SyncDataset:
         self.line_labels: Sequence[str] = self.meta_data["line_labels"]
         self.times = self._process_times()
         return self.dfile
-    
-    def get_line_for_stim_onset(self, waveform_type: Literal["sound", "audio", "opto"]) -> int:
-        return get_sync_line_for_stim_onset(waveform_type=waveform_type, date=self.start_time.date())
-    
+
+    def get_line_for_stim_onset(
+        self, waveform_type: Literal["sound", "audio", "opto"]
+    ) -> int:
+        return get_sync_line_for_stim_onset(
+            waveform_type=waveform_type, date=self.start_time.date()
+        )
+
     @property
     def sample_freq(self) -> float:
         try:
@@ -587,7 +601,7 @@ class SyncDataset:
 
         # duty cycle
         duty_cycle = self.duty_cycle(line)
-        
+
         if print_results:
             logger.info("*" * 70)
             if total_events <= 10:
