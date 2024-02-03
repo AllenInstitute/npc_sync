@@ -1,6 +1,6 @@
 # npc_sync
 
-Repackaging of AllenSDK.SyncDataset with extra functionality, compatible with data in the cloud.
+Repackaging of `AllenSDK.SyncDataset` with extra functionality, compatible with data in the cloud.
 
 [![PyPI](https://img.shields.io/pypi/v/npc_sync.svg?label=PyPI&color=blue)](https://pypi.org/project/npc_sync/)
 [![Python version](https://img.shields.io/pypi/pyversions/npc_sync)](https://pypi.org/project/npc_sync/)
@@ -15,9 +15,16 @@ conda create -n npc_sync python>=3.9
 conda activate npc_sync
 pip install npc_sync
 ```
-
+## Python
 ```python
-import npc_sync
+>>> import npc_sync
+
+>>> d = npc_sync.SyncDataset('s3://aind-ephys-data/ecephys_676909_2023-12-14_12-43-11/behavior_videos/20231214T124311.h5')
+>>> d.line_labels[0]
+'barcode_ephys'
+>>> d.validate(opto=True, audio=True)
+
+# note: some methods from the original `SyncDataset` are now property getters, including `line_labels`
 ```
 
 # Development
