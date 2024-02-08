@@ -659,8 +659,8 @@ class SyncDataset:
         # period
         try:
             period = self.period(line)
-        except IndexError: # not enough edges
-            period = {} 
+        except IndexError:  # not enough edges
+            period = {}
 
         avg_period = period.get("avg")
         max_period = period.get("max")
