@@ -170,7 +170,7 @@ class SyncDataset:
         camstim: bool = True,
         mvr: bool = True,
         barcodes: bool = True,
-        licks: bool = True,
+        licks: bool = False,
         opto: bool = False,
         audio: bool = False,
     ) -> None:
@@ -212,10 +212,7 @@ class SyncDataset:
 
     def _check_line(self, label_or_index: str | int) -> None:
         """Verify line is present and has events, or raise AssertionError."""
-        try:
-            stats = self.line_stats(label_or_index)
-        except IndexError:
-            raise AssertionError(f"Sync file has no line {label_or_index}")
+        stats = self.line_stats(label_or_index)
         if stats is None:
             raise AssertionError(f"Sync file has no events on line {label_or_index}")
 
@@ -660,15 +657,18 @@ class SyncDataset:
                 logger.info("*" * 70)
             return None
         # period
-        period = self.period(line)
+        try:
+            period = self.period(line)
+        except IndexError: # not enough edges
+            period = {} 
 
-        avg_period = period["avg"]
-        max_period = period["max"]
-        min_period = period["min"]
-        period_sd = period["sd"]
+        avg_period = period.get("avg")
+        max_period = period.get("max")
+        min_period = period.get("min")
+        period_sd = period.get("sd")
 
         # freq
-        avg_freq = self.frequency(line)
+        avg_freq = self.frequency(line) if period else None
 
         # duty cycle
         duty_cycle = self.duty_cycle(line)
@@ -749,7 +749,6 @@ class SyncDataset:
         """
         Returns the average frequency of a line.
         """
-
         period = self.period(line, edge)
         return 1.0 / period["avg"]
 
