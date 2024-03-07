@@ -58,8 +58,8 @@ def get_single_sync_path(
     """From an iterable of paths, return the one with the expected date and a
     .sync or .h5 extension.
 
-    >>> get_single_sync_path('s3://aind-ephys-data/ecephys_676909_2023-12-14_12-43-11/behavior_videos')
-    S3Path('s3://aind-ephys-data/ecephys_676909_2023-12-14_12-43-11/behavior_videos/20231214T124311.h5')
+    >>> get_single_sync_path('s3://aind-ephys-data/ecephys_676909_2023-12-14_12-43-11/behavior')
+    S3Path('s3://aind-ephys-data/ecephys_676909_2023-12-14_12-43-11/behavior/20231214T124311.h5')
     """
     if isinstance(dir_or_paths, str):
         dir_or_paths = npc_io.from_pathlike(dir_or_paths)
@@ -142,7 +142,7 @@ class SyncDataset:
 
     Examples
     --------
-    >>> dset = SyncDataset('s3://aind-ephys-data/ecephys_676909_2023-12-14_12-43-11/behavior_videos/20231214T124311.h5')
+    >>> dset = SyncDataset('s3://aind-ephys-data/ecephys_676909_2023-12-14_12-43-11/behavior/20231214T124311.h5')
     >>> dset.validate(opto=True, audio=True)
 
     >>> with SyncDataset('my_h5_file.h5') as d: # doctest: +SKIP
