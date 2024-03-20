@@ -268,12 +268,14 @@ class SyncDataset:
                 self.dfile = h5py.File(path, "r")
             except OSError:
                 path = npc_io.from_pathlike(path)
-                ffspec_storage_options = {}
-                if path.protocol not in ("", "file"):
-                    ffspec_storage_options["cache_type"] = "first"
-                self.dfile = h5py.File(
-                    path.open(mode="rb", **ffspec_storage_options), "r"
-                )
+                if path.protocol in ("", "file"):
+                    self.dfile = h5py.File(
+                        path.as_posix(), "r"
+                    )
+                else:
+                    self.dfile = h5py.File(
+                        path.open(mode="rb", cache_type="first"), "r"
+                    )
         return self.dfile
 
     @property
