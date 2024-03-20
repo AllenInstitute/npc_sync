@@ -10,6 +10,7 @@ Allen Institute for Brain Science
 from __future__ import annotations
 
 import datetime
+import io
 import logging
 from collections.abc import Iterable, Sequence
 from typing import TYPE_CHECKING, Any, Literal, Union
@@ -270,7 +271,7 @@ class SyncDataset:
                 path = npc_io.from_pathlike(path)
                 if path.protocol in ("", "file"):
                     self.dfile = h5py.File(
-                        path.as_posix(), "r"
+                        io.BytesIO(path.read_bytes()), "r"
                     )
                 else:
                     self.dfile = h5py.File(
