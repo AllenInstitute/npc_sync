@@ -268,14 +268,27 @@ class SyncDataset:
             try:
                 self.dfile = h5py.File(path, "r")
             except OSError:
+                path = npc_io.from_pathlike(path)
+                ffspec_storage_options = {}
+                if path.protocol not in ("", "file"):
+                    ffspec_storage_options["cache_type"] = "first"
                 self.dfile = h5py.File(
-                    io.BytesIO(npc_io.from_pathlike(path).read_bytes()), "r"
+                    path.open(mode="rb", **ffspec_storage_options), "r"
                 )
-        self.meta_data: dict[str, Any] = eval(self.dfile["meta"][()])
-        self.line_labels: Sequence[str] = self.meta_data["line_labels"]
-        self.times = self._process_times()
         return self.dfile
-
+    
+    @property
+    def meta_data(self) -> dict[str, Any]:
+        return eval(self.dfile["meta"][()])
+    
+    @property
+    def line_labels(self) -> Sequence[str]:
+        return self.meta_data["line_labels"]
+    
+    @property
+    def times(self) -> npt.NDArray[np.int64]:
+        return self._process_times()
+    
     def get_line_for_stim_onset(
         self, waveform_type: Literal["sound", "audio", "opto"]
     ) -> int:
