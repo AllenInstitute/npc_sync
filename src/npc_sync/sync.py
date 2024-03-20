@@ -10,7 +10,6 @@ Allen Institute for Brain Science
 from __future__ import annotations
 
 import datetime
-import io
 import logging
 from collections.abc import Iterable, Sequence
 from typing import TYPE_CHECKING, Any, Literal, Union
@@ -276,19 +275,19 @@ class SyncDataset:
                     path.open(mode="rb", **ffspec_storage_options), "r"
                 )
         return self.dfile
-    
+
     @property
     def meta_data(self) -> dict[str, Any]:
         return eval(self.dfile["meta"][()])
-    
+
     @property
     def line_labels(self) -> Sequence[str]:
         return self.meta_data["line_labels"]
-    
+
     @property
     def times(self) -> npt.NDArray[np.int64]:
         return self._process_times()
-    
+
     def get_line_for_stim_onset(
         self, waveform_type: Literal["sound", "audio", "opto"]
     ) -> int:
