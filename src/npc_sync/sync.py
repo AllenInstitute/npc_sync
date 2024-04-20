@@ -119,11 +119,13 @@ def get_bit(uint_array: npt.NDArray, bit: int) -> npt.NDArray[np.uint8]:
 
 
 def get_sync_line_for_stim_onset(
-    waveform_type: str | Literal["sound", "audio", "opto", "galvo", "laser_488", "laser_633"],
+    waveform_type: (
+        str | Literal["sound", "audio", "opto", "galvo", "laser_488", "laser_633"]
+    ),
     date: datetime.date | None = None,
 ) -> int:
     """Return the sync line index for the given waveform type.
-    
+
     - `opto` currently defaults to laser 488
     """
     if any(label in waveform_type for label in ("aud", "sound")):
@@ -312,7 +314,10 @@ class SyncDataset:
         return self._process_times()
 
     def get_line_for_stim_onset(
-        self, waveform_type: Literal["sound", "audio", "opto", "galvo", "laser_488", "laser_633"]
+        self,
+        waveform_type: Literal[
+            "sound", "audio", "opto", "galvo", "laser_488", "laser_633"
+        ],
     ) -> int:
         return get_sync_line_for_stim_onset(
             waveform_type=waveform_type, date=self.start_time.date()
