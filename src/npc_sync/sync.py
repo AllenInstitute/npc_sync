@@ -220,6 +220,8 @@ class SyncDataset:
             lines.append("lick_sensor")
         if opto:
             lines.append(self.get_line_for_stim_onset("opto"))
+            if self.start_time.date() >= FIRST_GALVO_ON_SYNC_DATE:
+                lines.append(self.get_line_for_stim_onset("galvo"))
         if audio and self.start_time.date() >= FIRST_SOUND_ON_SYNC_DATE:
             lines.append(self.get_line_for_stim_onset("audio"))
 
