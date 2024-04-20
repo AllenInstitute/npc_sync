@@ -119,17 +119,33 @@ def get_bit(uint_array: npt.NDArray, bit: int) -> npt.NDArray[np.uint8]:
 
 
 def get_sync_line_for_stim_onset(
-    waveform_type: str | Literal["sound", "audio", "opto"],
+    waveform_type: str | Literal["sound", "audio", "opto", "galvo", "laser_488", "laser_633"],
     date: datetime.date | None = None,
 ) -> int:
+    """Return the sync line index for the given waveform type.
+    
+    - `opto` currently defaults to laser 488
+    """
     if any(label in waveform_type for label in ("aud", "sound")):
         if date and date < FIRST_SOUND_ON_SYNC_DATE:
             raise ValueError(
                 f"Sound only recorded on sync since {FIRST_SOUND_ON_SYNC_DATE.isoformat()}: {date = }"
             )
         return 1
-    elif "opto" in waveform_type:
+    elif any(label in waveform_type for label in ("opto", "488")):
         return 11
+    elif "galvo" in waveform_type:
+        if date and date < FIRST_GALVO_ON_SYNC_DATE:
+            raise ValueError(
+                f"Galvo only recorded on sync since {FIRST_GALVO_ON_SYNC_DATE.isoformat()}: {date = }"
+            )
+        return 9
+    elif "633" in waveform_type:
+        if date and date < FIRST_GALVO_ON_SYNC_DATE:
+            raise ValueError(
+                f"Laser 688 only recorded on sync since {FIRST_GALVO_ON_SYNC_DATE.isoformat()}: {date = }"
+            )
+        return 10
     else:
         raise ValueError(f"Unexpected value: {waveform_type = }")
 
@@ -294,7 +310,7 @@ class SyncDataset:
         return self._process_times()
 
     def get_line_for_stim_onset(
-        self, waveform_type: Literal["sound", "audio", "opto"]
+        self, waveform_type: Literal["sound", "audio", "opto", "galvo", "laser_488", "laser_633"]
     ) -> int:
         return get_sync_line_for_stim_onset(
             waveform_type=waveform_type, date=self.start_time.date()
