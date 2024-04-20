@@ -36,6 +36,9 @@ FIRST_SOUND_ON_SYNC_DATE = datetime.date(2023, 8, 31)
 """Prior to this date, there's no sync line with "sound running" signal, on any rig: need to
 use NI-DAQ analog recording on OpenEphys PXI to get sound onset times."""
 
+FIRST_GALVO_ON_SYNC_DATE = datetime.date(2024, 4, 19)
+"""Prior to this date, opto experiments using the galvo system did not have a "galvo motor 
+running" signal, on any rig. A copy of the analog signal may have been recorded on the OpenEphys DAQ."""
 
 def get_sync_data(sync_path_or_data: SyncPathOrDataset) -> SyncDataset:
     """Open a path or file-like object and return a SyncDataset object."""
