@@ -40,6 +40,17 @@ FIRST_GALVO_ON_SYNC_DATE = datetime.date(2024, 4, 19)
 """Prior to this date, opto experiments using the galvo system did not have a "galvo motor
 running" signal, on any rig. A copy of the analog signal may have been recorded on the OpenEphys DAQ."""
 
+MONITOR_CENTER_REFRESH_TIME = 0.008
+"""Best estimate of time from photodiode flip (at top of screen) to updated
+content at the center of the screen. Screen refreshes in stages from top to bottom,
+in 16 ms: measured by Corbett."""
+
+AVERAGE_VSYNC_TO_DIODE_FLIP_TIME = 0.022
+
+CONSTANT_MONITOR_LAG: float = MONITOR_CENTER_REFRESH_TIME + AVERAGE_VSYNC_TO_DIODE_FLIP_TIME
+"""Best estimate of the average time between vsync falling edge and the center of
+the screen updating, in seconds. For use when a reliable photodiode signal
+is unavailable."""
 
 def get_sync_data(sync_path_or_data: SyncPathOrDataset) -> SyncDataset:
     """Open a path or file-like object and return a SyncDataset object."""
@@ -1250,11 +1261,7 @@ class SyncDataset:
 
             diode_flips = adjust_diode_flip_intervals(diode_flips)
 
-            AVERAGE_SCREEN_REFRESH_TIME = 0.008
-            """Screen refreshes in stages top-to-bottom, total 16 ms measured by
-            Corbett: use mid-point"""
-
-            frametimes = diode_flips + AVERAGE_SCREEN_REFRESH_TIME
+            frametimes = diode_flips + MONITOR_CENTER_REFRESH_TIME
             frame_display_time_blocks.append(frametimes)
 
         assert len(frame_display_time_blocks) == len(self.vsync_times_in_blocks)
