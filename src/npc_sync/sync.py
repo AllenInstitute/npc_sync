@@ -12,8 +12,8 @@ from __future__ import annotations
 import datetime
 import io
 import logging
-from collections.abc import Iterable, Sequence
 import os
+from collections.abc import Iterable, Sequence
 from typing import TYPE_CHECKING, Any, Literal, Union
 
 import h5py
@@ -48,13 +48,17 @@ in 16 ms: measured by Corbett."""
 
 AVERAGE_VSYNC_TO_DIODE_FLIP_TIME = 0.022
 
-CONSTANT_MONITOR_LAG: float = MONITOR_CENTER_REFRESH_TIME + AVERAGE_VSYNC_TO_DIODE_FLIP_TIME
+CONSTANT_MONITOR_LAG: float = (
+    MONITOR_CENTER_REFRESH_TIME + AVERAGE_VSYNC_TO_DIODE_FLIP_TIME
+)
 """Best estimate of the average time between vsync falling edge and the center of
 the screen updating, in seconds. For use when a reliable photodiode signal
 is unavailable."""
 
+
 def get_debug_flag() -> bool:
     return "DEBUG_SYNC" in os.environ
+
 
 def get_sync_data(sync_path_or_data: SyncPathOrDataset) -> SyncDataset:
     """Open a path or file-like object and return a SyncDataset object."""
@@ -1209,10 +1213,11 @@ class SyncDataset:
                     error_text = f"Mismatch in stim {block_idx = }: {len(diode_flips) = }, {len(vsyncs) = }"
                     if not get_debug_flag():
                         logger.warning(
-                            error_text + "\nReturning display times based on vsync + constanst lag."
+                            error_text
+                            + "\nReturning display times based on vsync + constanst lag."
                         )
                         return self.constant_lag_frame_display_time_blocks
-                    
+
                     logger.exception(error_text)
                     import matplotlib.pyplot as plt
 
@@ -1278,13 +1283,15 @@ class SyncDataset:
         return tuple(frame_display_time_blocks)
 
     @property
-    def constant_lag_frame_display_time_blocks(self) -> tuple[npt.NDArray[np.floating], ...]:
+    def constant_lag_frame_display_time_blocks(
+        self,
+    ) -> tuple[npt.NDArray[np.floating], ...]:
         """Blocks of vsync times + a constant: one block per stimulus. For use
         when a reliable photodiode signal is unavailable."""
         return tuple(
             block + CONSTANT_MONITOR_LAG for block in self.vsync_times_in_blocks
         )
-        
+
     def plot_all(
         self,
         start_time: float,
