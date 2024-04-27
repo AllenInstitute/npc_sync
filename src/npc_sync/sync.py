@@ -13,6 +13,7 @@ import datetime
 import io
 import logging
 from collections.abc import Iterable, Sequence
+import os
 from typing import TYPE_CHECKING, Any, Literal, Union
 
 import h5py
@@ -51,6 +52,9 @@ CONSTANT_MONITOR_LAG: float = MONITOR_CENTER_REFRESH_TIME + AVERAGE_VSYNC_TO_DIO
 """Best estimate of the average time between vsync falling edge and the center of
 the screen updating, in seconds. For use when a reliable photodiode signal
 is unavailable."""
+
+def get_debug_flag() -> bool:
+    return "DEBUG_SYNC" in os.environ
 
 def get_sync_data(sync_path_or_data: SyncPathOrDataset) -> SyncDataset:
     """Open a path or file-like object and return a SyncDataset object."""
