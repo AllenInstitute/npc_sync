@@ -1156,9 +1156,11 @@ class SyncDataset:
                     < median_diff(diode_flips, vsyncs)
                 ):
                     if counter > 2:  #!  this may need to be dereased to allow only 1
-                        raise ValueError(
-                            f"Added two missed diode flips at start already, the max we can explain by pre-stim background & first diode square being similar luminance. This is a different problem: sync {self.start_time=}."
+                        logger.warning(
+                            f"Added two missed diode flips at start already, the max we can explain by pre-stim background & first diode square being similar luminance. This is a different problem: sync {self.start_time=}"
+                            "\nReturning display times based on vsync + constant lag."
                         )
+                        return self.constant_lag_frame_display_time_blocks
                     logger.debug("Missing first diode flip")
                     diode_flips = add_missing_diode_flip_at_stim_onset(
                         diode_flips, vsyncs
@@ -1204,6 +1206,14 @@ class SyncDataset:
                     )
 
                 if len(diode_flips) != len(vsyncs):
+                    error_text = f"Mismatch in stim {block_idx = }: {len(diode_flips) = }, {len(vsyncs) = }"
+                    if not get_debug_flag():
+                        logger.warning(
+                            error_text + "\nReturning display times based on vsync + constanst lag."
+                        )
+                        return self.constant_lag_frame_display_time_blocks
+                    
+                    logger.exception(error_text)
                     import matplotlib.pyplot as plt
 
                     fig, _ = plt.subplots(1, 2)
@@ -1255,10 +1265,6 @@ class SyncDataset:
                     )
                     plt.show()
 
-                    raise IndexError(
-                        f"Mismatch in stim {block_idx = }: {len(diode_flips) = }, {len(vsyncs) = }"
-                    )
-
             else:
                 pass
                 # TODO adjust frametimes with diode data when flip is every 1 s
@@ -1271,6 +1277,14 @@ class SyncDataset:
         assert len(frame_display_time_blocks) == len(self.vsync_times_in_blocks)
         return tuple(frame_display_time_blocks)
 
+    @property
+    def constant_lag_frame_display_time_blocks(self) -> tuple[npt.NDArray[np.floating], ...]:
+        """Blocks of vsync times + a constant: one block per stimulus. For use
+        when a reliable photodiode signal is unavailable."""
+        return tuple(
+            block + CONSTANT_MONITOR_LAG for block in self.vsync_times_in_blocks
+        )
+        
     def plot_all(
         self,
         start_time: float,
