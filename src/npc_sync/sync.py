@@ -240,9 +240,16 @@ class SyncDataset:
         if licks:
             lines.append("lick_sensor")
         if opto:
-            lines.append(self.get_line_for_stim_onset("opto"))
-            if self.start_time.date() >= FIRST_GALVO_ON_SYNC_DATE:
-                lines.append(self.get_line_for_stim_onset("galvo"))
+            has_laser_633_and_galvo = self.start_time.date() >= FIRST_GALVO_ON_SYNC_DATE
+            try:
+                self._check_line(a := self.get_line_for_stim_onset("laser_488"))
+            except AssertionError:
+                if has_laser_633_and_galvo:
+                    self._check_line(b := self.get_line_for_stim_onset("laser_633"))
+                else:
+                    raise AssertionError(f"Sync file has no events on opto lines {a = } or {b = }") from None
+            if has_laser_633_and_galvo:
+                self._check_line(self.get_line_for_stim_onset("galvo"))
         if audio and self.start_time.date() >= FIRST_SOUND_ON_SYNC_DATE:
             lines.append(self.get_line_for_stim_onset("audio"))
 
