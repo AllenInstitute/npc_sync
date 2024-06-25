@@ -325,7 +325,7 @@ class SyncDataset:
                     self.dfile = h5py.File(io.BytesIO(path.read_bytes()), "r")
                 else:
                     self.dfile = h5py.File(
-                        path.open(mode="rb", cache_type="first"), "r"
+                        path.open(mode="rb"), "r"
                     )
         return self.dfile
 
