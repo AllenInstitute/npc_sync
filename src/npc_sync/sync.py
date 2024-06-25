@@ -324,9 +324,7 @@ class SyncDataset:
                 if path.protocol in ("", "file"):
                     self.dfile = h5py.File(io.BytesIO(path.read_bytes()), "r")
                 else:
-                    self.dfile = h5py.File(
-                        path.open(mode="rb"), "r"
-                    )
+                    self.dfile = h5py.File(path.open(mode="rb"), "r")
         return self.dfile
 
     @property
@@ -893,7 +891,7 @@ class SyncDataset:
     ) -> tuple[npt.NDArray[np.floating], npt.NDArray[np.floating]]:
         """Rising edges and falling edges on stim_running line, filtered for
         erroneous events and guaranteed to be of equal length.
-        
+
         - excludes falling edges alone at start, and rising edges alone at end
         - excludes rising+falling pairs that contain exactly one vsync events:
             we have one session (DRpilot_726088_20240618) where a stim was cancelled
@@ -917,7 +915,9 @@ class SyncDataset:
         assert len(stim_running_rising_edges) == len(stim_running_falling_edges)
         vsyncs = self.get_falling_edges("vsync_stim", units="seconds")
         idx_for_removal = []
-        for idx, (on, off) in enumerate(zip(stim_running_rising_edges, stim_running_falling_edges)):
+        for idx, (on, off) in enumerate(
+            zip(stim_running_rising_edges, stim_running_falling_edges)
+        ):
             if (s := vsyncs[(vsyncs >= on) & (vsyncs <= off)].size) == 1:
                 # keeping this strict for now to only affect one session
                 logger.warning(
@@ -925,8 +925,12 @@ class SyncDataset:
                     " - excluding from analysis"
                 )
                 idx_for_removal.append(idx)
-        stim_running_rising_edges = np.delete(stim_running_rising_edges, idx_for_removal)
-        stim_running_falling_edges = np.delete(stim_running_falling_edges, idx_for_removal)
+        stim_running_rising_edges = np.delete(
+            stim_running_rising_edges, idx_for_removal
+        )
+        stim_running_falling_edges = np.delete(
+            stim_running_falling_edges, idx_for_removal
+        )
         return stim_running_rising_edges, stim_running_falling_edges
 
     def filter_on_stim_running(
