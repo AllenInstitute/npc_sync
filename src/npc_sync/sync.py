@@ -946,7 +946,21 @@ class SyncDataset:
             mask |= (data >= on) & (data <= off)
 
         return data[mask]
+    
+    def divide_into_stim_running_blocks(
+        self, data: npt.NDArray[np.floating]
+    ) -> tuple[npt.NDArray[np.floating], ...]:
+        """Divide data into blocks corresponding to stim_running being high.
 
+        Data must be in seconds relative to first sample."""
+        if self.stim_running_edges[0].size == 0:
+            return (data,)
+        blocks = []
+        for on, off in zip(*self.stim_running_edges):
+            blocks.append(data[(data >= on) & (data <= off)])
+
+        return tuple(blocks)
+    
     @property
     def total_seconds(self) -> float:
         return self.meta_data["total_samples"] / self.sample_freq
@@ -1018,12 +1032,20 @@ class SyncDataset:
         diode_falling_edges = self.get_falling_edges("stim_photodiode", units="seconds")
         assert abs(len(diode_rising_edges) - len(diode_falling_edges)) < 2
 
-        diode_rising_edges_in_blocks = reshape_into_blocks(
-            self.filter_on_stim_running(diode_rising_edges), min_gap=1.0
-        )
-        diode_falling_edges_in_blocks = reshape_into_blocks(
-            self.filter_on_stim_running(diode_falling_edges), min_gap=1.0
-        )
+        if self.stim_running_edges[0].size > 0: # has stim running signal
+            diode_rising_edges_in_blocks = self.divide_into_stim_running_blocks(
+                diode_rising_edges
+            )
+            diode_falling_edges_in_blocks = self.divide_into_stim_running_blocks(
+                diode_falling_edges
+            )
+        else:
+            diode_rising_edges_in_blocks = reshape_into_blocks(
+                self.filter_on_stim_running(diode_rising_edges), min_gap=1.0,
+            )
+            diode_falling_edges_in_blocks = reshape_into_blocks(
+                self.filter_on_stim_running(diode_falling_edges), min_gap=1.0,
+            )
 
         if any(
             len(diode_edge_blocks) < len(vsync_times_in_blocks)
