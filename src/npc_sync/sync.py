@@ -946,7 +946,7 @@ class SyncDataset:
             mask |= (data >= on) & (data <= off)
 
         return data[mask]
-    
+
     def divide_into_stim_running_blocks(
         self, data: npt.NDArray[np.floating]
     ) -> tuple[npt.NDArray[np.floating], ...]:
@@ -960,7 +960,7 @@ class SyncDataset:
             blocks.append(data[(data >= on) & (data <= off)])
 
         return tuple(blocks)
-    
+
     @property
     def total_seconds(self) -> float:
         return self.meta_data["total_samples"] / self.sample_freq
@@ -1032,7 +1032,7 @@ class SyncDataset:
         diode_falling_edges = self.get_falling_edges("stim_photodiode", units="seconds")
         assert abs(len(diode_rising_edges) - len(diode_falling_edges)) < 2
 
-        if self.stim_running_edges[0].size > 0: # has stim running signal
+        if self.stim_running_edges[0].size > 0:  # has stim running signal
             diode_rising_edges_in_blocks = self.divide_into_stim_running_blocks(
                 diode_rising_edges
             )
@@ -1041,10 +1041,12 @@ class SyncDataset:
             )
         else:
             diode_rising_edges_in_blocks = reshape_into_blocks(
-                self.filter_on_stim_running(diode_rising_edges), min_gap=1.0,
+                self.filter_on_stim_running(diode_rising_edges),
+                min_gap=1.0,
             )
             diode_falling_edges_in_blocks = reshape_into_blocks(
-                self.filter_on_stim_running(diode_falling_edges), min_gap=1.0,
+                self.filter_on_stim_running(diode_falling_edges),
+                min_gap=1.0,
             )
 
         if any(
@@ -1184,7 +1186,7 @@ class SyncDataset:
                         self.constant_lag_frame_display_time_blocks[block_idx]
                     )
                     continue
-                
+
                 def score(diode_flips, vsyncs) -> float:
                     """Similarity between diode and vsync intervals - higher is
                     more similar"""
