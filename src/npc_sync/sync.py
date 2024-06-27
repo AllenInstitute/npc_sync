@@ -1225,12 +1225,15 @@ class SyncDataset:
                     < median_diff(diode_flips, vsyncs[1:])
                     < median_diff(diode_flips, vsyncs)
                 ):
-                    if counter > 2:  #!  this may need to be dereased to allow only 1
+                    if counter > 2:  #!  this may need to be decreased to allow only 1
                         logger.warning(
                             f"Added two missed diode flips at start already, the max we can explain by pre-stim background & first diode square being similar luminance. This is a different problem: sync {self.start_time=}"
-                            "\nReturning display times based on vsync + constant lag."
+                            f"\nReturning display times based on vsync + constant lag for {block_idx=}."
                         )
-                        return self.constant_lag_frame_display_time_blocks
+                        frame_display_time_blocks.append(
+                            self.constant_lag_frame_display_time_blocks[block_idx]
+                        )
+                        continue
                     logger.debug("Missing first diode flip")
                     diode_flips = add_missing_diode_flip_at_stim_onset(
                         diode_flips, vsyncs
@@ -1280,10 +1283,12 @@ class SyncDataset:
                     if not get_debug_flag():
                         logger.warning(
                             error_text
-                            + "\nReturning display times based on vsync + constanst lag."
+                            + f"\nReturning display times based on vsync + constanst lag for {block_idx=}."
                         )
-                        return self.constant_lag_frame_display_time_blocks
-
+                        frame_display_time_blocks.append(
+                            self.constant_lag_frame_display_time_blocks[block_idx]
+                        )
+                        continue
                     logger.exception(error_text)
                     import matplotlib.pyplot as plt
 
