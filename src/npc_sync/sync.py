@@ -1175,6 +1175,16 @@ class SyncDataset:
                 # we have to assume that vsyncs are correct at this point (no
                 # extras, none missing)
 
+                if np.abs(len(diode_flips) - len(vsyncs)) > 10 * 60:
+                    logger.warning(
+                        f"Stim {block_idx=} has {len(diode_flips)=} diode flips, {len(vsyncs)=} vsyncs:"
+                        "too great a difference to correct. Returning display times based on vsync + constant lag."
+                    )
+                    frame_display_time_blocks.append(
+                        self.constant_lag_frame_display_time_blocks[block_idx]
+                    )
+                    continue
+                
                 def score(diode_flips, vsyncs) -> float:
                     """Similarity between diode and vsync intervals - higher is
                     more similar"""
