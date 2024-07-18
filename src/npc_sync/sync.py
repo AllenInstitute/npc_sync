@@ -1245,7 +1245,7 @@ class SyncDataset:
                     counter += 1
                 if aborted:
                     continue
-                
+
                 while (
                     median_diff(diode_flips, vsyncs)
                     < MIN_VSYNC_DIODE_FLIP_SEPARATION_SEC
