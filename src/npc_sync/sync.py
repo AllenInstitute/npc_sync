@@ -1219,6 +1219,7 @@ class SyncDataset:
                     return np.median(diode_flips[:common_len] - vsyncs[:common_len])
 
                 counter = 0
+                aborted = False
                 while (
                     median_diff(diode_flips, vsyncs)
                     > MAX_VSYNC_DIODE_FLIP_SEPARATION_SEC
@@ -1235,13 +1236,16 @@ class SyncDataset:
                         frame_display_time_blocks.append(
                             self.constant_lag_frame_display_time_blocks[block_idx]
                         )
-                        continue
+                        aborted = True
+                        break
                     logger.debug("Missing first diode flip")
                     diode_flips = add_missing_diode_flip_at_stim_onset(
                         diode_flips, vsyncs
                     )
                     counter += 1
-
+                if aborted:
+                    continue
+                
                 while (
                     median_diff(diode_flips, vsyncs)
                     < MIN_VSYNC_DIODE_FLIP_SEPARATION_SEC
