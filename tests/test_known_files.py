@@ -53,7 +53,22 @@ def test_slow_processing_file() -> None:
     _ = s.frame_display_time_blocks
     t = time.time() - t0
     assert t < 60, f"file with many missing diode flips is being processed too slowly: {t = }"
-    
+
+
+def test_missing_diode_flips_at_start_of_block() -> None:
+    def helper() -> None:
+        s = npc_sync.SyncDataset(
+            's3://aind-ephys-data/ecephys_666986_2023-08-14_11-38-55/behavior/20230814T113855.h5'
+        )
+        _ = s.frame_display_time_blocks
+    # launch job in a separate thread, then kill if it takes too long
+    import threading
+    t = threading.Thread(target=helper)
+    t.start()
+    t.join(20)
+    assert not t.is_alive(), "file with missing diode flips at start of block is taking too long to process"
+
+
 @pytest.mark.skip(reason="We have no way to resolve this issue yet, and so far it has only affected files other than the main DR task")
 def test_vsync_mismatch_file() -> None:
     """A session that has stim blocks with vsyncs recorded on sync that were not
