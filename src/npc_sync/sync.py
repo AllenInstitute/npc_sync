@@ -1177,7 +1177,7 @@ class SyncDataset:
                 # we have to assume that vsyncs are correct at this point (no
                 # extras, none missing)
 
-                if np.abs(len(diode_flips) - len(vsyncs)) > 10 * 60:
+                if np.abs(len(diode_flips) - len(vsyncs)) > 2:
                     logger.warning(
                         f"Stim {block_idx=} has {len(diode_flips)=} diode flips, {len(vsyncs)=} vsyncs:"
                         "too great a difference to correct. Returning display times based on vsync + constant lag."
