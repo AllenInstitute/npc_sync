@@ -14,7 +14,7 @@ dependencies = [
     "npc-io>=0.1.26",
     "npc-session>=0.1.33",
 ]
-version = "0.1.16"
+version = "0.1.17"
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Programming Language :: Python :: 3",
