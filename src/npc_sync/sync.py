@@ -196,6 +196,7 @@ class SyncDataset:
 
 
     """
+
     def __init__(self, path) -> None:
         if isinstance(path, self.__class__):
             self = path
@@ -1365,7 +1366,11 @@ class SyncDataset:
             frametimes = diode_flips + MONITOR_CENTER_REFRESH_TIME
             frame_display_time_blocks.append(frametimes)
 
-        assert len(frame_display_time_blocks) == len(self.vsync_times_in_blocks) == len(blocks_using_diode)
+        assert (
+            len(frame_display_time_blocks)
+            == len(self.vsync_times_in_blocks)
+            == len(blocks_using_diode)
+        )
         self._blocks_using_diode = tuple(blocks_using_diode)
         return tuple(frame_display_time_blocks)
 
