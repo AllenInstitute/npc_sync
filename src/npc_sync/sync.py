@@ -196,8 +196,6 @@ class SyncDataset:
 
 
     """
-    blocks_using_diode: tuple[bool, ...]
-    
     def __init__(self, path) -> None:
         if isinstance(path, self.__class__):
             self = path
@@ -1025,6 +1023,12 @@ class SyncDataset:
         raise ValueError(f"Unexpected vsync period: {med} sec")
 
     @npc_io.cached_property
+    def is_block_using_diode(self) -> tuple[bool, ...]:
+        if getattr(self, "_blocks_using_diode", None) is None:
+            _ = self.frame_display_time_blocks
+        return self._blocks_using_diode
+
+    @npc_io.cached_property
     def frame_display_time_blocks(self) -> tuple[npt.NDArray[np.floating], ...]:
         """Blocks of adjusted diode times: one block per stimulus."""
         vsync_times_in_blocks = self.vsync_times_in_blocks
@@ -1362,7 +1366,7 @@ class SyncDataset:
             frame_display_time_blocks.append(frametimes)
 
         assert len(frame_display_time_blocks) == len(self.vsync_times_in_blocks) == len(blocks_using_diode)
-        self.blocks_using_diode = tuple(blocks_using_diode)
+        self._blocks_using_diode = tuple(blocks_using_diode)
         return tuple(frame_display_time_blocks)
 
     @property
