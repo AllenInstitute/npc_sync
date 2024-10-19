@@ -1662,7 +1662,7 @@ class SyncDataset:
         # add ` width_ratios=num_diode_flips/min(num_diode_flips)``
         fig, _ = plt.subplots(
             1,
-            len(all_diode_flips),
+            len(diode_flips_per_stim),
             sharey=True,
             gridspec_kw={
                 "width_ratios": num_diode_flips_per_stim / min(num_diode_flips_per_stim)
