@@ -1656,20 +1656,7 @@ class SyncDataset:
         expected_period = 1 / frequency
 
         # get the intervals in parts (one for each stimulus)
-        diode_flips_per_stim = []
-        for son, soff in zip(stim_ons, stim_offs):
-            # get the vsyncs that occur during this stimulus
-            vsyncs = all_vsyncs[np.where((all_vsyncs > son) & (all_vsyncs < soff))]
-            # get the diode flips that occur during this stimulus, while vsyncs are occurring
-            diode_flips = all_diode_flips[
-                np.where(
-                    (all_diode_flips > son)
-                    & (all_diode_flips < soff)
-                    & (all_diode_flips > vsyncs[0])
-                    & (all_diode_flips < vsyncs[-1])
-                )
-            ]
-            diode_flips_per_stim.append(sorted(diode_flips))
+        diode_flips_per_stim = self.divide_into_stim_running_blocks(all_diode_flips)
 
         num_diode_flips_per_stim = np.array([len(_) for _ in diode_flips_per_stim])
         # add ` width_ratios=num_diode_flips/min(num_diode_flips)``
