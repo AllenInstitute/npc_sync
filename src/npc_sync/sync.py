@@ -296,7 +296,7 @@ class SyncDataset:
         """
         times = self.get_all_events()[:, 0:1].astype(np.int64)
 
-        intervals = np.ediff1d(times, to_begin=0)
+        intervals = np.ediff1d(times, to_begin=np.uint8(0))
         rollovers = np.where(intervals < 0)[0]
 
         for i in rollovers:
@@ -392,7 +392,7 @@ class SyncDataset:
 
         """
         bit_array = self.get_bit(bit)
-        return np.ediff1d(bit_array, to_begin=0)
+        return np.ediff1d(bit_array, to_begin=np.uint8(0))
 
     def get_line_changes(self, line: str | int) -> npt.NDArray[np.uint8]:
         """
