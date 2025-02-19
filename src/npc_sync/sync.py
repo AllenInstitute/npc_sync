@@ -350,7 +350,7 @@ class SyncDataset:
         )
         if "opto" not in waveform_type:
             return line
-        if np.any(self.get_edges('all', line, units='seconds')):
+        if np.any(self.get_edges("all", line, units="seconds")):
             return line
         return get_sync_line_for_stim_onset("laser_633", self.start_time.date())
 
@@ -912,7 +912,9 @@ class SyncDataset:
 
         if any(stim_running_rising_edges) and any(stim_running_falling_edges):
             if stim_running_rising_edges[0] > stim_running_falling_edges[0]:
-                stim_running_falling_edges: np.ndarray[Any, np.dtype[Any]] = stim_running_falling_edges[1:]
+                stim_running_falling_edges = (
+                    stim_running_falling_edges[1:]
+                )
             if stim_running_falling_edges[-1] < stim_running_rising_edges[-1]:
                 stim_running_falling_edges = np.concatenate(
                     [stim_running_falling_edges, [self.total_seconds]]
