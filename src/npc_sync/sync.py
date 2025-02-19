@@ -527,7 +527,7 @@ class SyncDataset:
     def get_edges(
         self,
         kind: Literal["rising", "falling", "all"],
-        keys: str | Sequence[str],
+        keys: str | int | Sequence[str | int],
         units: Literal["seconds", "samples"],
     ) -> npt.NDArray:
         """Utility function for extracting edge times from a line
@@ -564,7 +564,7 @@ class SyncDataset:
             falling = self.get_edges("falling", keys, units)
             return np.sort(np.concatenate([rising, falling]))
 
-        if isinstance(keys, str):
+        if isinstance(keys, (str, int)):
             keys = [keys]
 
         for key in keys:
