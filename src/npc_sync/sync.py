@@ -345,9 +345,14 @@ class SyncDataset:
             "sound", "audio", "opto", "galvo", "laser_488", "laser_633"
         ],
     ) -> int:
-        return get_sync_line_for_stim_onset(
+        line = get_sync_line_for_stim_onset(
             waveform_type=waveform_type, date=self.start_time.date()
         )
+        if "opto" not in waveform_type:
+            return line
+        if np.any(self.get_edges('all', line, units='seconds')):
+            return line
+        return get_sync_line_for_stim_onset("laser_633", self.start_time.date())
 
     @property
     def sample_freq(self) -> float:
