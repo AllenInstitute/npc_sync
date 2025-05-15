@@ -1034,6 +1034,144 @@ class SyncDataset:
             _ = self.frame_display_time_blocks
         return self._blocks_using_diode
 
+
+    @staticmethod
+    def discretize_vsync_times(
+        vsync_times: npt.NDArray,
+        on_flip_times: npt.NDArray,
+        is_first_frame_on: bool,
+        frame_rate: float = 60.0,
+    ) -> npt.NDArray:
+        """
+        Discretize vsync times to multiples of 1/frame_rate, using photodiode signals
+        to determine long frames, whether they are visible in vsync intervals or not.
+        
+        Args:
+            vsync_times: Array of vsync timestamps in seconds
+            on_frame_times: Photodiode on-frame times for validation and correction
+            frame_rate: Expected frame rate in Hz (default: 60.0)
+            
+        Returns:
+            Array of discretized vsync times
+            
+        >>> on_frame_times = np.array([0, 3, 5, 9]) * 1/60
+        
+        When vsyncs show long intervals:
+        >>> discretize_vsync_times(np.array([0, 1, 3, 4, 5, 6, 9]) * 1/60, on_frame_times, is_first_frame_on=True) * 60
+        array([0., 1., 3., 4., 5., 6., 9.])
+
+        When vsyncs do not show long intervals:
+        >>> discretize_vsync_times(np.array([0, 1, 2, 3, 4, 5, 6]) * 1/60, on_frame_times, is_first_frame_on=True) * 60
+        array([0. , 1.5, 3. , 4. , 5. , 7. , 9. ])
+        
+        When first frame is off we can't adjust the first vsync time:
+        >>> discretize_vsync_times(np.array([0, 1, 2, 3, 4, 5, 6, 7]) * 1/60, on_frame_times, is_first_frame_on=False) * 60
+        array([0. , 0., 1.5, 3. , 4. , 5. , 7. , 9. ])
+        """
+        frame_duration = 1.0 / frame_rate
+        
+        # Get first vsync time as reference
+        t0 = vsync_times[0]
+        
+        if not is_first_frame_on:
+            # If the first frame is off, we can't adjust the first vsync time - discard it for now
+            vsync_times = vsync_times[1:]
+            
+        
+
+        photodiode_intervals = np.diff(on_flip_times)
+        # Note: photodiode_intervals represents 2 frames duration (one on_frame + one off_frame)
+        expected_interval_frames = 2  # Expected number of frames between consecutive on_frame signals
+        
+        # Identify long photodiode intervals
+        long_intervals = []
+        for i, interval_dur in enumerate(photodiode_intervals):
+            # Calculate how many frames this interval should span (normally 2 frames)
+            n_frames_in_interval = round(interval_dur / frame_duration)
+            
+            assert n_frames_in_interval >= expected_interval_frames, (
+                f"Short photodiode interval at index {i} - should not happen if photodiode signal has been properly filtered: {interval_dur:.4f}s ≈ {interval_dur/frame_duration:.2f} frames"
+            ) 
+            if n_frames_in_interval > expected_interval_frames:
+                long_intervals.append((i, n_frames_in_interval))
+                    
+        # Second stage: initial discretization of vsync times assuming no dropped frames
+        initial_frame_indices = np.arange(len(vsync_times), dtype=float)
+
+        adjusted_frame_indices = initial_frame_indices.copy()
+        
+        # Process each abnormal interval to determine actual frame timing
+        for i, n_frames in long_intervals:
+
+            # get indices of vsyncs for on and off frames
+            vsync_idx = (expected_interval_frames * i, (expected_interval_frames * i) + 1)
+
+            vsync_intervals = np.diff(vsync_times[vsync_idx[0]: vsync_idx[0] + 3])
+            
+            vsync_n_frames = [np.round(interval / frame_duration) for interval in vsync_intervals]
+
+            if np.sum(vsync_n_frames) != n_frames:
+                # if n frames estimated from vsync intervals is not consistent with estimate from photodiode intervals
+                #! set off-frame to be at the center of the interval:
+                adjusted_frame_indices[vsync_idx[1]] = adjusted_frame_indices[vsync_idx[0]] + (n_frames / 2)
+            else:
+                # use the n frames estimated from vsync intervals to adjust the frame indices
+                adjusted_frame_indices[vsync_idx[1]] = adjusted_frame_indices[vsync_idx[0]] + vsync_n_frames[0]
+                
+            # regardless of within-interval modification, shift all subsequent frames to account for
+            # long interval:
+            adjusted_frame_indices[vsync_idx[1] + 1:] = adjusted_frame_indices[vsync_idx[1] + 1:] + (n_frames - expected_interval_frames)
+                
+        if not is_first_frame_on:
+            # If the first frame is off, we need to add the first vsync time back, and we have to assume
+            # it is a single frame interval (in practice this is likely unimportant, as no events happen
+            # on the first frame of a stimulus):
+            discretized_times = np.insert(adjusted_frame_indices, 0, 0) + 1 # shift all other times by 1 frame
+            
+        # Convert adjusted frame indices back to times
+        discretized_times = t0 + adjusted_frame_indices * frame_duration
+
+        return discretized_times
+
+    @staticmethod
+    def apply_monitor_delay(
+        discretized_vsync_times: npt.NDArray, 
+        on_flip_times: npt.NDArray,
+        is_first_frame_on: bool,
+        window_sec: float = 30,
+        fps: float = 60.0,
+        rolling: bool = False,
+    ) -> npt.NDArray:
+        assert 0 <= (len(discretized_vsync_times) / 2) - len(on_flip_times) <= 1
+            
+        window_len = round(window_sec * fps * 0.5) # halved because we're applying to times for on-frames only
+        if is_first_frame_on:
+            on_vsync_times = discretized_vsync_times[::2]
+        else:
+            on_vsync_times = discretized_vsync_times[1::2]
+        if rolling:
+            window = np.ones(window_len)
+            delays = np.convolve(on_flip_times - on_vsync_times, window, mode="same")
+            # make delays the same length as discretized_vsync_times:
+            return discretized_vsync_times + np.repeat(delays, 2)[:len(discretized_vsync_times)]
+        
+        else:
+            delays = np.array(on_flip_times) - np.array(on_vsync_times)
+            # print(f'{discretized_vsync_times[:6]=}')
+            # print(f'{on_flip_times[:6]=}')
+            print(f"{np.median(delays)=:.4f} s")
+
+            # add the median of the delays over blocks of window_sec * fps to vsync times,
+            # making sure that the last block isn't skipped
+            adjusted_vsync_times = discretized_vsync_times.copy()
+            for i in range(0, len(delays), window_len):
+                if i + window_len < len(delays):
+                    adjusted_vsync_times[i : i + 2*window_len] += np.median(delays[i : i + window_len])
+                else:
+                    adjusted_vsync_times[i:] += np.median(delays[i:])
+            return adjusted_vsync_times
+
+
     @npc_io.cached_property
     def frame_display_time_blocks(self) -> tuple[npt.NDArray[np.floating], ...]:
         """Blocks of adjusted diode times: one block per stimulus."""
@@ -1166,7 +1304,8 @@ class SyncDataset:
             rising = rising[rising < (vsyncs[-1] + MAX_VSYNC_DIODE_FLIP_SEPARATION_SEC)]
 
             diode_flips = np.sort(np.concatenate((rising, falling)))
-
+            is_first_frame_on = rising[0] < falling[0] # may be updated below
+            
             short_interval_threshold = (
                 0.1 * 1 / 60
             )  # at 60 fps we should never have diode-flip intervals this small: consider them anomalous
@@ -1177,6 +1316,8 @@ class SyncDataset:
 
             while any(short_interval_indices(diode_flips)):
                 indices = short_interval_indices(diode_flips)
+                if indices[0] == 0:
+                    is_first_frame_on = not is_first_frame_on
                 diode_flips = np.delete(diode_flips, slice(indices[0], indices[0] + 2))
 
             one_diode_flip_per_vsync: bool = round(
@@ -1256,6 +1397,7 @@ class SyncDataset:
                     diode_flips = add_missing_diode_flip_at_stim_onset(
                         diode_flips, vsyncs
                     )
+                    is_first_frame_on = not is_first_frame_on
                     counter += 1
                 if aborted:
                     continue
@@ -1270,7 +1412,8 @@ class SyncDataset:
                 ):
                     logger.debug("Removing extra first diode flip")
                     diode_flips = diode_flips[1:]
-
+                    is_first_frame_on = not is_first_frame_on
+                    
                 if len(diode_flips) < len(vsyncs):
                     if (
                         is_last_vsync_close_to_end_of_sync := abs(
@@ -1366,9 +1509,39 @@ class SyncDataset:
                 pass
                 # TODO adjust frametimes with diode data when flip is every 1 s
 
-            diode_flips = adjust_diode_flip_intervals(diode_flips)
-
-            frametimes = diode_flips + MONITOR_CENTER_REFRESH_TIME
+            on_flip_times = diode_flips[::2] if is_first_frame_on else diode_flips[1::2]
+            discretized_vsync_times = self.discretize_vsync_times(
+                vsync_times=vsyncs,
+                on_flip_times=on_flip_times,
+                is_first_frame_on=is_first_frame_on,
+                frame_rate=self.expected_frame_display_rate,
+            )
+            assert np.all(
+                0 < (on_flip_times - discretized_vsync_times[::2])
+            ), 'Some diode flip times are before their corresponding vsyncs which is impossible'
+            import matplotlib.pyplot as plt
+            plt.figure()
+            plt.gcf()
+            plt.plot(on_flip_times, discretized_vsync_times[::2], '.')
+            plt.title(f"Diode flip times (x) vs vsync times (y) for block {block_idx}\nshould be 1:1")
+            plt.savefig(f'adjusted_times_{block_idx=}.png')
+            plt.figure()
+            plt.gcf()
+            plt.plot(on_flip_times - discretized_vsync_times[::2], '.')
+            plt.title(f"ON-photodiode time minus discretized vsync time for block {block_idx}\nshould be flat")
+            plt.savefig(f'delays_{block_idx=}.png')
+            #! reinstate assertion below after debugging
+            # assert np.all(
+            #     (on_flip_times - discretized_vsync_times[::2]) < 0.5
+            # ), 'Some diode flip times are more than 0.5 s after their corresponding vsyncs which is not realistic'
+            adjusted_vsync_times = self.apply_monitor_delay(
+                discretized_vsync_times=discretized_vsync_times,
+                on_flip_times=on_flip_times,
+                is_first_frame_on=is_first_frame_on,
+                window_sec=30,
+                fps=self.expected_frame_display_rate,
+            )
+            frametimes = adjusted_vsync_times + MONITOR_CENTER_REFRESH_TIME
             frame_display_time_blocks.append(frametimes)
 
         assert (
