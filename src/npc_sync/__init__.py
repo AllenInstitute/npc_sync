@@ -1,5 +1,5 @@
 """
-    Repackaging of AllenSDK.SyncDataset with extra functionality, compatible with data in the cloud.
+Repackaging of AllenSDK.SyncDataset with extra functionality, compatible with data in the cloud.
 """
 
 import doctest
