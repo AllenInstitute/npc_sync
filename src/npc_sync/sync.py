@@ -2167,6 +2167,7 @@ def is_part_of_normal_pair(prev_interval_dur, suspicious_interval_dur, next_inte
     Must detect anomalous intervals that don't sum to an integer number of frames:
     >>> is_part_of_normal_pair(1.3 / 59.95, 0.01 / 59.95, 0.7 / 59.95)
     False
+    
     Must detect anomalous intervals that don't sum to an integer number of frames:
     >>> is_part_of_normal_pair(2.3 / 59.95, 0.01 / 59.95, 0.7 / 59.95)
     False
