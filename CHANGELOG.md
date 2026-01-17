@@ -8,14 +8,22 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 <!-- insertion marker -->
 ## Unreleased
 
-<small>[Compare with latest](https://github.com/AllenInstitute/npc_sync/compare/v0.1.24...HEAD)</small>
+<small>[Compare with latest](https://github.com/AllenInstitute/npc_sync/compare/v0.1.25...HEAD)</small>
+
+### Fixed
+
+- Fix bugs for variable len sync square ([f6f0af7](https://github.com/AllenInstitute/npc_sync/commit/f6f0af7f92bc9edbaeea4788f39906188554a6a0) by bjhardcastle).
+
+<!-- insertion marker -->
+## [v0.1.25](https://github.com/AllenInstitute/npc_sync/releases/tag/v0.1.25) - 2025-07-29
+
+<small>[Compare with v0.1.24](https://github.com/AllenInstitute/npc_sync/compare/v0.1.24...v0.1.25)</small>
 
 ### Fixed
 
 - Fix test ([6db1a84](https://github.com/AllenInstitute/npc_sync/commit/6db1a841a35d778da5562eb6cc0022b4334eaacf) by bjhardcastle).
 - Fix deprecated cross-platform format ([ce9f2a7](https://github.com/AllenInstitute/npc_sync/commit/ce9f2a7fb3289d66a3acc2ffe68c4a676a6d1b8b) by bjhardcastle).
 
-<!-- insertion marker -->
 ## [v0.1.24](https://github.com/AllenInstitute/npc_sync/releases/tag/v0.1.24) - 2025-02-19
 
 <small>[Compare with v0.1.23](https://github.com/AllenInstitute/npc_sync/compare/v0.1.23...v0.1.24)</small>
