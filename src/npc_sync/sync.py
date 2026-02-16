@@ -2172,7 +2172,8 @@ def get_frame_display_times(
         ## ^ at the moment this may be violated (very infrequently, and only on a couple of frames in a block) so it's disabled
     else:
         # photodiode signal changes every N screen refreshes (here N = 3)
-        # where frames are dropped, N = 3 + ?
+        # - when frames are "dropped", N is extended by some number of frames (typically 1 but can be
+        #   more). We have reliable ON times and must work out when the dropped frames ocurred  
         #    _____________           _____________              _____________
         #    |   :   :   |   :   :   |   :   :   |   :      :   |   :   :   |
         # ___|   :   :   |___:___:___|   :   :   |___:______:___|   :   :   |__
@@ -2185,14 +2186,16 @@ def get_frame_display_times(
                 f"{stim_id} | first diode edge in block is falling - this should not be possible with default TaskControl settings."
                 "Either the min vsync-diode flip interval needs shortening or we have spontaneous flicker. Needs handling."
             )
-        n_on_to_on_refreshes = np.round(np.diff(on_flip_times) / FRAME_INTERVAL)
+
         n_on_to_off_refreshes = np.round(
             (off_flip_times - on_flip_times[: len(off_flip_times)]) / FRAME_INTERVAL
         )
-        assert min(n_on_to_off_refreshes) >= vsyncs_per_flip
+        assert len(n_on_to_off_refreshes) == len(off_flip_times) <= len(on_flip_times)
+        assert min(n_on_to_off_refreshes[:-1]) >= vsyncs_per_flip
         adjusted_off_flip_times = on_flip_times[: len(off_flip_times)] + (
             n_on_to_off_refreshes * FRAME_INTERVAL
         )
+        assert np.all(adjusted_off_flip_times > on_flip_times)
         flips = np.sort(np.concatenate([on_flip_times, adjusted_off_flip_times]))
 
         # - flips wont be exactly N-frames long, but must be longer than (N-1 + some variability)
@@ -2202,16 +2205,14 @@ def get_frame_display_times(
             np.diff(flips[:-1]) > ((vsyncs_per_flip - 0.75) * FRAME_INTERVAL)
         ), f"{stim_id} has diode flip intervals that are too short: {min(np.diff(flips)) * FRAME_RATE = :.3f}, {np.mean(np.diff(flips)) * FRAME_RATE = :.3f} (expected {vsyncs_per_flip})"
 
-        # now find display times between each rising-falling edge pair
+        # now work out actual frame display times between each rising-falling edge pair
         display_times = []
         regular_intervals = np.arange(
             0, vsyncs_per_flip * FRAME_INTERVAL, FRAME_INTERVAL
         )
+        n_refreshes_per_interval = np.round(np.diff(flips) / FRAME_INTERVAL)
         for idx, (flip, n_refreshes) in enumerate(
-            zip(flips[:-1], np.round(np.diff(flips) / FRAME_INTERVAL))
-        ):
-            #! last flip will be skipped: append after loop
-
+            zip(flips[:-1], n_refreshes_per_interval, strict=True)
             if display_times:
                 assert (
                     flip > display_times[-1]
