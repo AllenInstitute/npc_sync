@@ -2128,9 +2128,10 @@ def get_frame_display_times(
                 logger.warning(
                     f"All {len(smoothed_long_vsync_misalignment)} long frame display times are misaligned with vsyncs by +1 frame: we have an extra diode flip at the start of the stim block to remove"
                 )
+                #! remember we shifted vsyncs at the top of the function
                 assert (
-                    x := display_times[0] - vsync_times[0]
-                ) < MIN_VSYNC_DIODE_FLIP_SEPARATION_SEC, f"Expected first display time to have lower than usual latency after first vsync: got {x} s"
+                    display_times[0] < vsync_times[0]
+                ), f"Expected first display time to have lower than usual latency after first vsync: got {x} s"
                 display_times = display_times[1:]  # remove the first frame
             elif len(
                 smoothed_long_vsync_misalignment[smoothed_long_vsync_misalignment == -1]
@@ -2142,9 +2143,10 @@ def get_frame_display_times(
                 logger.warning(
                     f"All {len(smoothed_long_vsync_misalignment)} long frame display times are misaligned with vsyncs by -1 frame: likely missed a diode flip at the start of the stim block"
                 )
+                #! remember we shifted vsyncs at the top of the function
                 assert (
                     x := (display_times[0] - vsync_times[0])
-                ) > 2 * MIN_VSYNC_DIODE_FLIP_SEPARATION_SEC, f"Expected first display time to have higher than usual latency after first vsync: got {x} s"
+                ) > 0.5 * FRAME_INTERVAL, f"Expected first display time to have higher than usual latency after first vsync: got {MIN_VSYNC_DIODE_FLIP_SEPARATION_SEC + x} s"
                 display_times = np.insert(
                     display_times, 0, display_times[0] - median_refresh_interval
                 )  # add the first frame
