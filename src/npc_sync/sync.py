@@ -1896,9 +1896,9 @@ def discard_erroneous_diode_flips_at_stim_offset(
 def get_frame_display_times(
     vsync_times: npt.NDArray,
     on_flip_times: npt.NDArray,
+    off_flip_times: npt.NDArray,
     vsyncs_per_flip: int,
     is_first_frame_off: bool | None = None,
-    off_flip_times: npt.NDArray | None = None,
     adjust_dropped_frames: bool = True,
     check_lengths: bool = True,
     check_vsyncs: bool = True,
