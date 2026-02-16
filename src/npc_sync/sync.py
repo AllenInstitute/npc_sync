@@ -1219,6 +1219,8 @@ class SyncDataset:
             #! decide how to toggle this: env var?
             fallback_or_none: npt.NDArray[np.floating] | None = (
                 self.constant_lag_frame_display_time_blocks[block_idx]
+                if os.getenv('SYNC_FALLBACK_CONSTANT_LAG')
+                else None
             )
 
             # keep flips after first vsync + an empirically determined min latency
