@@ -10,7 +10,7 @@ import pytest
 
 import npc_sync
 
-
+@pytest.mark.skip(reason="Disabled as we don't fallback to vsync times + constant monitor lag")
 def test_screen_flicker_file() -> None:
     """One of the sessions that has 'phantom' screen flicker in the sync square at
     the start of some stim blocks. 
