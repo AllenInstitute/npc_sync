@@ -2213,6 +2213,14 @@ def get_frame_display_times(
         n_refreshes_per_interval = np.round(np.diff(flips) / FRAME_INTERVAL)
         for idx, (flip, n_refreshes) in enumerate(
             zip(flips[:-1], n_refreshes_per_interval, strict=True)
+        ):
+            # last flip is skipped, which is what we would want in the ideal case that
+            # n_frames % (2 * vsyncs_per_flip) < vsyncs_per_flip, AND the inter-stim screen is black
+            # e.g.
+            #    _____________ <-- last OFF is not a stim frame but transition to inter-stim black
+            #    |   :   :   |
+            # ___|   :   :   |___________________
+            # doesn't hold if the last sync square is black: deal with this after the loop
             if display_times:
                 assert (
                     flip > display_times[-1]
@@ -2222,7 +2230,11 @@ def get_frame_display_times(
             if n_dropped == 0:
                 display_times.extend(flip + regular_intervals)
                 continue
-
+            if n_dropped < 0 and idx == (len(n_refreshes_per_interval) - 1):
+                # short last interval as stim stops before N presentations of sync square
+                display_times.extend(flip + regular_intervals[:int(n_dropped)])
+                continue
+            
             # use corresponding vsync intervals to determine which frame(s) were dropped
             vsync_intervals = np.diff(
                 vsync_times[idx * vsyncs_per_flip : (idx + 1) * vsyncs_per_flip + 1]
@@ -2283,23 +2295,25 @@ def get_frame_display_times(
             assert len(new_times) == vsyncs_per_flip
             assert flips[idx + 1] not in new_times, "prematurely added next flip"
             display_times.extend(new_times)
-        # add the last flip, which we necessarily missed out in the for-loop above:
-        display_times.append(flips[-1])
 
         # at this point, we could have up to vsync_intervals -1 frames not enclosed by a diode flip at
         # the end of the experiment, for example:
         #    _____________           _____________________ <-- display stays bright after last frame
         #    |   :   :   |   :   :   |   :   :
         # ___|   :   :   |___:___:___|   :   :
+        #    _____________
+        #    |   :   :   |   :   :
+        # ___|   :   :   |___:___:______________
         n_missing = len(vsync_times) - len(display_times)
-        # the last n_missing vsyncs would also have to occur after the current last diode flip time:
-        min_latency = np.min(display_times - vsync_times[: len(display_times)])
-        is_missing_from_end = np.all(
-            vsync_times[-n_missing:] > (display_times[-1] + min_latency)
+        
+        if n_missing > 0:
+            assert flips[-1] not in display_times, f"already used last flip in display times"
+            if n_missing > vsyncs_per_flip:
+                logger.warning(f"More missing frames ({n_missing}) than vsyncs per flip ({vsyncs_per_flip}) - indicates that this is something different to the last flip being missed")
+            display_times.extend(flips[-1] + np.arange(
+               0, n_missing * FRAME_INTERVAL, FRAME_INTERVAL
+            )
         )
-        if 0 > n_missing < (vsyncs_per_flip - 1) and is_missing_from_end:
-            for _ in range(n_missing):
-                display_times.append(display_times[-1] + FRAME_INTERVAL)
 
     assert not np.any(np.isnan(display_times))
     assert np.all(np.diff(display_times) > 0)
@@ -2379,6 +2393,9 @@ def anomalous_interval_indices(flips, num_vsyncs_per_diode_flip: float):
     ):
         if idx in short_intervals:
             continue
+        if num_vsyncs_per_diode_flip > 1 and idx == len(intervals) - 1:
+            continue # the last interval can be short as it returns to dark screen before N stim frames
+        
         # a short blip on the line must occur as an ON-OFF pair, due to the way sync detects rising/falling edges (e.g. cannot have to rising)
         # ie both indices must be present, so we can delete the first one
 
