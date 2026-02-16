@@ -969,30 +969,35 @@ class SyncDataset:
         return stim_running_rising_edges, stim_running_falling_edges
 
     def filter_on_stim_running(
-        self, data: npt.NDArray[np.floating]
+        self, data: npt.NDArray[np.floating], end_padding: float = 0,
     ) -> npt.NDArray[np.floating]:
         """Filter data to only include times when stim_running is high.
 
-        Data must be in seconds relative to first sample."""
+        Data must be in seconds relative to first sample.
+        - end_padding extends the stim_running off edge in each block, in order to capture delayed presentation of frames. 
+        """
         if self.stim_running_edges[0].size == 0:
             return data
         mask = [False] * len(data)
         for on, off in zip(*self.stim_running_edges):
-            mask |= (data >= on) & (data <= off)
+            mask |= (data >= on) & (data <= off + end_padding)
 
         return data[mask]
 
     def divide_into_stim_running_blocks(
-        self, data: npt.NDArray[np.floating]
+        self, data: npt.NDArray[np.floating], end_padding: float = 0,
     ) -> tuple[npt.NDArray[np.floating], ...]:
         """Divide data into blocks corresponding to stim_running being high.
 
-        Data must be in seconds relative to first sample."""
+        Data must be in seconds relative to first sample.
+        - end_padding extends the stim_running off edge in each block, in order to capture delayed presentation of frames. 
+
+        """
         if self.stim_running_edges[0].size == 0:
             return (data,)
         blocks = []
         for on, off in zip(*self.stim_running_edges):
-            blocks.append(data[(data >= on) & (data <= off)])
+            blocks.append(data[(data >= on) & (data <= off + end_padding)])
 
         return tuple(blocks)
 
@@ -1102,21 +1107,21 @@ class SyncDataset:
         diode_rising_edges = self.get_rising_edges("stim_photodiode", units="seconds")
         diode_falling_edges = self.get_falling_edges("stim_photodiode", units="seconds")
         assert abs(len(diode_rising_edges) - len(diode_falling_edges)) < 2
-
+        end_padding = 10 * FRAME_INTERVAL
         if self.stim_running_edges[0].size > 0:  # has stim running signal
             diode_rising_edges_in_blocks = self.divide_into_stim_running_blocks(
-                diode_rising_edges
+                diode_rising_edges, end_padding=end_padding
             )
             diode_falling_edges_in_blocks = self.divide_into_stim_running_blocks(
-                diode_falling_edges
+                diode_falling_edges, end_padding=end_padding
             )
         else:
             diode_rising_edges_in_blocks = reshape_into_blocks(
-                self.filter_on_stim_running(diode_rising_edges),
+                self.filter_on_stim_running(diode_rising_edges, end_padding=end_padding),
                 min_gap=1.0,
             )
             diode_falling_edges_in_blocks = reshape_into_blocks(
-                self.filter_on_stim_running(diode_falling_edges),
+                self.filter_on_stim_running(diode_falling_edges, end_padding=end_padding),
                 min_gap=1.0,
             )
 
