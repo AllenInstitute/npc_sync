@@ -97,6 +97,12 @@ def test_file_with_aborted_stim_block() -> None:
     )
     assert len(s.stim_running_edges[0]) == 7
 
+def test_flips_outside_stim_running() -> None:
+    """A file with 3 diode flips per vsync interval. The last pair of flips for the task occur after
+    stim running goes low"""
+    s = npc_sync.SyncDataset('s3://aind-open-data/ecephys_795555_2025-08-25_12-01-16/behavior/20250825T120116.h5')
+    assert len(s.frame_display_time_blocks[3]) == 216896, "Handling of flips outside stim running is incorrect"
+
 def test_standard_file() -> None:
     """A standard file with no issues."""
     s = npc_sync.SyncDataset('s3://aind-ephys-data/ecephys_662892_2023-08-21_12-43-45/behavior/20230821T124345.h5')
