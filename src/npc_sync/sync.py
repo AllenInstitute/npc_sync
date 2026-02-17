@@ -969,12 +969,14 @@ class SyncDataset:
         return stim_running_rising_edges, stim_running_falling_edges
 
     def filter_on_stim_running(
-        self, data: npt.NDArray[np.floating], end_padding: float = 0,
+        self,
+        data: npt.NDArray[np.floating],
+        end_padding: float = 0,
     ) -> npt.NDArray[np.floating]:
         """Filter data to only include times when stim_running is high.
 
         Data must be in seconds relative to first sample.
-        - end_padding extends the stim_running off edge in each block, in order to capture delayed presentation of frames. 
+        - end_padding extends the stim_running off edge in each block, in order to capture delayed presentation of frames.
         """
         if self.stim_running_edges[0].size == 0:
             return data
@@ -985,12 +987,14 @@ class SyncDataset:
         return data[mask]
 
     def divide_into_stim_running_blocks(
-        self, data: npt.NDArray[np.floating], end_padding: float = 0,
+        self,
+        data: npt.NDArray[np.floating],
+        end_padding: float = 0,
     ) -> tuple[npt.NDArray[np.floating], ...]:
         """Divide data into blocks corresponding to stim_running being high.
 
         Data must be in seconds relative to first sample.
-        - end_padding extends the stim_running off edge in each block, in order to capture delayed presentation of frames. 
+        - end_padding extends the stim_running off edge in each block, in order to capture delayed presentation of frames.
 
         """
         if self.stim_running_edges[0].size == 0:
@@ -1117,11 +1121,15 @@ class SyncDataset:
             )
         else:
             diode_rising_edges_in_blocks = reshape_into_blocks(
-                self.filter_on_stim_running(diode_rising_edges, end_padding=end_padding),
+                self.filter_on_stim_running(
+                    diode_rising_edges, end_padding=end_padding
+                ),
                 min_gap=1.0,
             )
             diode_falling_edges_in_blocks = reshape_into_blocks(
-                self.filter_on_stim_running(diode_falling_edges, end_padding=end_padding),
+                self.filter_on_stim_running(
+                    diode_falling_edges, end_padding=end_padding
+                ),
                 min_gap=1.0,
             )
 
@@ -1219,7 +1227,7 @@ class SyncDataset:
             #! decide how to toggle this: env var?
             fallback_or_none: npt.NDArray[np.floating] | None = (
                 self.constant_lag_frame_display_time_blocks[block_idx]
-                if os.getenv('SYNC_FALLBACK_CONSTANT_LAG')
+                if os.getenv("SYNC_FALLBACK_CONSTANT_LAG")
                 else None
             )
 
@@ -2175,7 +2183,7 @@ def get_frame_display_times(
     else:
         # photodiode signal changes every N screen refreshes (here N = 3)
         # - when frames are "dropped", N is extended by some number of frames (typically 1 but can be
-        #   more). We have reliable ON times and must work out when the dropped frames ocurred  
+        #   more). We have reliable ON times and must work out when the dropped frames ocurred
         #    _____________           _____________              _____________
         #    |   :   :   |   :   :   |   :   :   |   :      :   |   :   :   |
         # ___|   :   :   |___:___:___|   :   :   |___:______:___|   :   :   |__
@@ -2235,9 +2243,9 @@ def get_frame_display_times(
                 continue
             if n_dropped < 0 and idx == (len(n_refreshes_per_interval) - 1):
                 # short last interval as stim stops before N presentations of sync square
-                display_times.extend(flip + regular_intervals[:int(n_dropped)])
+                display_times.extend(flip + regular_intervals[: int(n_dropped)])
                 continue
-            
+
             # use corresponding vsync intervals to determine which frame(s) were dropped
             vsync_intervals = np.diff(
                 vsync_times[idx * vsyncs_per_flip : (idx + 1) * vsyncs_per_flip + 1]
@@ -2308,15 +2316,18 @@ def get_frame_display_times(
         #    |   :   :   |   :   :
         # ___|   :   :   |___:___:______________
         n_missing = len(vsync_times) - len(display_times)
-        
+
         if n_missing > 0:
-            assert flips[-1] not in display_times, f"already used last flip in display times"
+            assert (
+                flips[-1] not in display_times
+            ), "already used last flip in display times"
             if n_missing > vsyncs_per_flip:
-                logger.warning(f"More missing frames ({n_missing}) than vsyncs per flip ({vsyncs_per_flip}) - indicates that this is something different to the last flip being missed")
-            display_times.extend(flips[-1] + np.arange(
-               0, n_missing * FRAME_INTERVAL, FRAME_INTERVAL
+                logger.warning(
+                    f"More missing frames ({n_missing}) than vsyncs per flip ({vsyncs_per_flip}) - indicates that this is something different to the last flip being missed"
+                )
+            display_times.extend(
+                flips[-1] + np.arange(0, n_missing * FRAME_INTERVAL, FRAME_INTERVAL)
             )
-        )
 
     assert not np.any(np.isnan(display_times))
     assert np.all(np.diff(display_times) > 0)
@@ -2397,8 +2408,8 @@ def anomalous_interval_indices(flips, num_vsyncs_per_diode_flip: float):
         if idx in short_intervals:
             continue
         if num_vsyncs_per_diode_flip > 1 and idx == len(intervals) - 1:
-            continue # the last interval can be short as it returns to dark screen before N stim frames
-        
+            continue  # the last interval can be short as it returns to dark screen before N stim frames
+
         # a short blip on the line must occur as an ON-OFF pair, due to the way sync detects rising/falling edges (e.g. cannot have to rising)
         # ie both indices must be present, so we can delete the first one
 

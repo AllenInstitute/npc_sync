@@ -8,13 +8,27 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 <!-- insertion marker -->
 ## Unreleased
 
-<small>[Compare with latest](https://github.com/AllenInstitute/npc_sync/compare/v0.1.25...HEAD)</small>
+<small>[Compare with latest](https://github.com/AllenInstitute/npc_sync/compare/v0.1.26...HEAD)</small>
+
+### Added
+
+- Add test for 3 frame ON/OFF file ([840dfa7](https://github.com/AllenInstitute/npc_sync/commit/840dfa7c2158db285d1ec4e84c49ee4207bd37cf) by bjhardcastle).
+- Add assertions and comments ([500c841](https://github.com/AllenInstitute/npc_sync/commit/500c8416e2b979f126b4d0bad1c26d7e98ea0364) by bjhardcastle).
+
+### Fixed
+
+- Fix zip strict for 3.9 ([561cc34](https://github.com/AllenInstitute/npc_sync/commit/561cc343cf8cdb0976212eb863b92bb5115529e6) by bjhardcastle).
+- Fix assertions for shifted vsyncs introduced in f6f0af7 ([afa2b92](https://github.com/AllenInstitute/npc_sync/commit/afa2b92d36218e9bd747b2f7dd5de4687bfc1aa5) by bjhardcastle).
+
+<!-- insertion marker -->
+## [v0.1.26](https://github.com/AllenInstitute/npc_sync/releases/tag/v0.1.26) - 2026-01-17
+
+<small>[Compare with v0.1.25](https://github.com/AllenInstitute/npc_sync/compare/v0.1.25...v0.1.26)</small>
 
 ### Fixed
 
 - Fix bugs for variable len sync square ([f6f0af7](https://github.com/AllenInstitute/npc_sync/commit/f6f0af7f92bc9edbaeea4788f39906188554a6a0) by bjhardcastle).
 
-<!-- insertion marker -->
 ## [v0.1.25](https://github.com/AllenInstitute/npc_sync/releases/tag/v0.1.25) - 2025-07-29
 
 <small>[Compare with v0.1.24](https://github.com/AllenInstitute/npc_sync/compare/v0.1.24...v0.1.25)</small>
