@@ -2213,8 +2213,9 @@ def get_frame_display_times(
             0, vsyncs_per_flip * FRAME_INTERVAL, FRAME_INTERVAL
         )
         n_refreshes_per_interval = np.round(np.diff(flips) / FRAME_INTERVAL)
+        assert len(n_refreshes_per_interval) == len(flips[:-1])
         for idx, (flip, n_refreshes) in enumerate(
-            zip(flips[:-1], n_refreshes_per_interval, strict=True)
+            zip(flips[:-1], n_refreshes_per_interval)
         ):
             # last flip is skipped, which is what we would want in the ideal case that
             # n_frames % (2 * vsyncs_per_flip) < vsyncs_per_flip, AND the inter-stim screen is black
