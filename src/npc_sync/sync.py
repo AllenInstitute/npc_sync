@@ -260,7 +260,7 @@ class SyncDataset:
                 [
                     f"{cam}_cam_{suffix}"
                     for cam in ("beh", "eye", "face")
-                    for suffix in ("frame_readout", "exposing")
+                    for suffix in ("exposing",)
                 ]
             )
         if barcodes:
