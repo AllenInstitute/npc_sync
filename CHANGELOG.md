@@ -8,7 +8,16 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 <!-- insertion marker -->
 ## Unreleased
 
-<small>[Compare with latest](https://github.com/AllenInstitute/npc_sync/compare/v0.1.26...HEAD)</small>
+<small>[Compare with latest](https://github.com/AllenInstitute/npc_sync/compare/v0.2.1...HEAD)</small>
+
+### Removed
+
+- Remove cam frame_readout lines from validation ([8d4cf56](https://github.com/AllenInstitute/npc_sync/commit/8d4cf567c8515728e5a2e7d1e0ea8efeff7317eb) by bjhardcastle).
+
+<!-- insertion marker -->
+## [v0.2.1](https://github.com/AllenInstitute/npc_sync/releases/tag/v0.2.1) - 2026-02-17
+
+<small>[Compare with v0.1.26](https://github.com/AllenInstitute/npc_sync/compare/v0.1.26...v0.2.1)</small>
 
 ### Added
 
@@ -20,7 +29,6 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 - Fix zip strict for 3.9 ([561cc34](https://github.com/AllenInstitute/npc_sync/commit/561cc343cf8cdb0976212eb863b92bb5115529e6) by bjhardcastle).
 - Fix assertions for shifted vsyncs introduced in f6f0af7 ([afa2b92](https://github.com/AllenInstitute/npc_sync/commit/afa2b92d36218e9bd747b2f7dd5de4687bfc1aa5) by bjhardcastle).
 
-<!-- insertion marker -->
 ## [v0.1.26](https://github.com/AllenInstitute/npc_sync/releases/tag/v0.1.26) - 2026-01-17
 
 <small>[Compare with v0.1.25](https://github.com/AllenInstitute/npc_sync/compare/v0.1.25...v0.1.26)</small>
