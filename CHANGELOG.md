@@ -8,13 +8,17 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 <!-- insertion marker -->
 ## Unreleased
 
-<small>[Compare with latest](https://github.com/AllenInstitute/npc_sync/compare/v0.2.1...HEAD)</small>
+<small>[Compare with latest](https://github.com/AllenInstitute/npc_sync/compare/v0.2.2...HEAD)</small>
+
+<!-- insertion marker -->
+## [v0.2.2](https://github.com/AllenInstitute/npc_sync/releases/tag/v0.2.2) - 2026-02-24
+
+<small>[Compare with v0.2.1](https://github.com/AllenInstitute/npc_sync/compare/v0.2.1...v0.2.2)</small>
 
 ### Removed
 
 - Remove cam frame_readout lines from validation ([8d4cf56](https://github.com/AllenInstitute/npc_sync/commit/8d4cf567c8515728e5a2e7d1e0ea8efeff7317eb) by bjhardcastle).
 
-<!-- insertion marker -->
 ## [v0.2.1](https://github.com/AllenInstitute/npc_sync/releases/tag/v0.2.1) - 2026-02-17
 
 <small>[Compare with v0.1.26](https://github.com/AllenInstitute/npc_sync/compare/v0.1.26...v0.2.1)</small>
