@@ -222,8 +222,8 @@ class SyncDataset:
         stim_paths: Iterable[npc_io.PathLike] | None = None,
     ) -> None:
         if isinstance(path, self.__class__):
-            self = path
-            self.dfile = path
+            self.path = path.path
+            self.dfile = path.dfile
         else:
             self.path = npc_io.from_pathlike(path)
             self.dfile = self.load(path)
@@ -360,10 +360,7 @@ class SyncDataset:
 
     @property
     def meta_data(self) -> dict[str, Any]:
-        try:
-            return eval(self.dfile["meta"][()])
-        except AttributeError:
-            return eval(self["meta"][()])
+        return eval(self.dfile["meta"][()])
 
     @property
     def line_labels(self) -> Sequence[str]:
