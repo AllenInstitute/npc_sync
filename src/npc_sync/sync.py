@@ -1312,6 +1312,12 @@ class SyncDataset:
 
             rising, falling = split_flips(flips, is_first_frame_on)
 
+            if self.block_index_to_stim_path[block_idx] is None and os.getenv("SYNC_ALLOW_MISSING_STIM_FILES"):
+                logger.debug(
+                    f"Block {block_idx} has no stim file available to verify number of vsyncs. Skipping."
+                )
+                frame_display_time_blocks.append(fallback_or_none)
+                continue
             assert self.block_index_to_stim_path[block_idx] is not None
 
             # script_frame_intervals = h5py.File(self.block_index_to_stim_path[block_idx])['frameIntervals'][:]
