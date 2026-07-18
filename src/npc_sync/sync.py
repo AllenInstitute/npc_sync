@@ -1312,7 +1312,9 @@ class SyncDataset:
 
             rising, falling = split_flips(flips, is_first_frame_on)
 
-            if self.block_index_to_stim_path[block_idx] is None and os.getenv("SYNC_ALLOW_MISSING_STIM_FILES"):
+            if self.block_index_to_stim_path[block_idx] is None and os.getenv(
+                "SYNC_ALLOW_MISSING_STIM_FILES"
+            ):
                 logger.debug(
                     f"Block {block_idx} has no stim file available to verify number of vsyncs. Skipping."
                 )
