@@ -1104,6 +1104,31 @@ class SyncDataset:
             result[block_idx] = npc_stim.get_total_stim_frames(stim_data)
         return result
 
+    def _get_diode_box_frame_interval(self, block_idx: int) -> int:
+        """Return the number of frames between diode-box flips for a block.
+
+        Stim files created before ``diodeBoxFrameInterval`` was added always
+        flipped the diode box every frame, so missing metadata defaults to 1.
+        """
+        path = self.block_index_to_stim_path[block_idx]
+        if path is None:
+            return 1
+        stim_data = None
+        try:
+            stim_data = npc_stim.get_stim_data(path)
+            value = stim_data.get("diodeBoxFrameInterval", 1)
+            if isinstance(value, h5py.Dataset):
+                value = value[()]
+            return int(value)
+        except Exception as exc:
+            logger.warning(
+                f"Failed to load diodeBoxFrameInterval for block {block_idx} at {path}: {exc}"
+            )
+            return 1
+        finally:
+            if isinstance(stim_data, h5py.File):
+                stim_data.close()
+
     @npc_io.cached_property
     def frame_display_time_blocks(self) -> tuple[npt.NDArray[np.floating], ...]:
         """Blocks of adjusted diode times: one block per stimulus."""
@@ -1252,12 +1277,7 @@ class SyncDataset:
                 """Concatenate the rising and falling edges into a single array."""
                 return np.sort(np.concatenate((rising, falling)))
 
-            # July 2025 we updated the photodiode interval from every frame to every 3 frames
-            vsyncs_per_diode_flip: int = (
-                1
-                if self.start_time < datetime.datetime(2025, 7, 15)
-                else round(np.mean(np.diff(concat_flips(rising, falling))) * FRAME_RATE)
-            )
+            vsyncs_per_diode_flip = self._get_diode_box_frame_interval(block_idx)
 
             if (
                 vsyncs_per_diode_flip == 1
