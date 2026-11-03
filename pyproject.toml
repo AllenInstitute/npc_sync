@@ -14,7 +14,7 @@ dependencies = [
     "npc-io>=0.1.26",
     "npc-session>=0.1.33",
     "scipy>=1.13.1",
-    "npc-stim>=0.1.14",
+    "npc-stim>=0.1.23",
 ]
 version = "0.2.6"
 classifiers = [
