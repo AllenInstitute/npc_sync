@@ -63,6 +63,11 @@ MIN_VSYNC_DIODE_FLIP_SEPARATION_SEC = 0.015  # 0.022 is typical
 FRAME_RATE = 59.95
 FRAME_INTERVAL = 1 / FRAME_RATE
 # we've seen apparently real flip intervals of 0.29 * 59.95, and the line between anomalous and real isn't clear-cut
+REPLAY_SLOT_SAMPLES = 10_000
+"""Slot width, in samples, used to fingerprint sync events when looking for replayed
+acquisition buffers. Buffer sizes seen so far (50,000 and 10,000 samples) are multiples
+of this. Buffer size is not recorded in the sync file metadata."""
+
 SUSPICIOUS_INTERVAL_THRESHOLD = 0.3 / FRAME_RATE
 DEFINITE_SHORT_INTERVAL_THRESHOLD = 0.05 / FRAME_RATE
 # at 60 fps we should never have diode-flip intervals this small: consider them anomalous
@@ -152,6 +157,104 @@ def get_bit(uint_array: npt.NDArray, bit: int) -> npt.NDArray[np.uint8]:
 
     """
     return np.bitwise_and(uint_array, 2**bit).astype(bool).astype(np.uint8)
+
+
+def _splitmix64(x: npt.NDArray[np.uint64]) -> npt.NDArray[np.uint64]:
+    """Vectorized splitmix64 finalizer: scrambles 64-bit integers."""
+    x = x.astype(np.uint64, copy=True)
+    with np.errstate(over="ignore"):
+        x ^= x >> np.uint64(30)
+        x *= np.uint64(0xBF58476D1CE4E5B9)
+        x ^= x >> np.uint64(27)
+        x *= np.uint64(0x94D049BB133111EB)
+        x ^= x >> np.uint64(31)
+    return x
+
+
+def find_replayed_buffers(
+    times: npt.ArrayLike,
+    bits: npt.ArrayLike,
+    slot_samples: int = REPLAY_SLOT_SAMPLES,
+) -> tuple[tuple[tuple[int, int], ...], int | None]:
+    """Find acquisition buffers in a sync event list that are replayed copies of a later
+    buffer.
+
+    Some sync files contain runs of consecutive buffers with identical event content on
+    every line (same sample times relative to the buffer start, same bit states). The
+    copies overwrite real data; the last buffer of each run is assumed to be genuine.
+
+    Method: split events into slots of `slot_samples`, fingerprint each non-empty slot
+    by summing a hash of each event's (time relative to slot start, bit state), then find
+    slots with identical fingerprints. The most common slot separation between identical
+    slots gives the buffer size, so any buffer size that is a multiple of `slot_samples`
+    is found. Buffers are assumed to be aligned to sample 0.
+
+    Parameters
+    ----------
+    times : array of int
+        Sample index of each event.
+    bits : array of int
+        Bit state (all lines) of each event.
+    slot_samples : int
+        Fingerprint slot width in samples. Must divide the buffer size.
+
+    Returns
+    -------
+    intervals : tuple of (start, stop) sample indices
+        Half-open intervals of replayed copies. `stop` is the start of the genuine buffer.
+    buffer_size : int or None
+        Inferred buffer size in samples, or None if no replay was found.
+
+    Examples
+    --------
+    >>> rng = np.random.default_rng(0)
+    >>> buffer, n_buffers = 50_000, 20
+    >>> rel = [np.sort(rng.choice(buffer, 100, replace=False)) for _ in range(n_buffers)]
+    >>> state = [rng.integers(0, 2**32, 100) for _ in range(n_buffers)]
+    >>> for i in (5, 6, 7):  # buffers 5-7 are copies of buffer 8
+    ...     rel[i], state[i] = rel[8], state[8]
+    >>> times = np.concatenate([r + i * buffer for i, r in enumerate(rel)])
+    >>> find_replayed_buffers(times, np.concatenate(state))
+    (((250000, 400000),), 50000)
+    >>> find_replayed_buffers(times[times < 250_000], np.concatenate(state)[times < 250_000])
+    ((), None)
+    """
+    times = np.asarray(times).astype(np.int64)
+    bits = np.asarray(bits).astype(np.uint64)
+    if times.size == 0:
+        return (), None
+    slot = times // slot_samples
+    starts = np.flatnonzero(np.r_[True, slot[1:] != slot[:-1]])  # non-empty slots only
+    tokens = ((times - slot * slot_samples).astype(np.uint64) << np.uint64(32)) | (
+        bits & np.uint64(0xFFFFFFFF)
+    )
+    with np.errstate(over="ignore"):
+        fingerprints = np.add.reduceat(_splitmix64(tokens), starts)
+    slots = slot[starts]
+    order = np.lexsort((slots, fingerprints))  # by fingerprint, then slot
+    fingerprints, slots = fingerprints[order], slots[order]
+    same = fingerprints[1:] == fingerprints[:-1]
+    if not same.any():
+        return (), None
+    earlier = slots[:-1][same]
+    lags = slots[1:][same] - earlier
+    values, counts = np.unique(lags, return_counts=True)
+    lag = int(values[np.argmax(counts)])
+    if len(values) > 1:
+        logger.warning(
+            "Identical sync slots found at more than one separation "
+            f"(in units of {slot_samples} samples): "
+            f"{dict(zip(values.tolist(), counts.tolist()))}. Using the most common ({lag})."
+        )
+    buffer_size = lag * slot_samples
+    copies = np.unique(earlier[lags == lag] // lag)  # buffer index of each replayed copy
+    breaks = np.flatnonzero(np.diff(copies) != 1)
+    first = copies[np.r_[0, breaks + 1]]
+    last = copies[np.r_[breaks, len(copies) - 1]]
+    intervals = tuple(
+        (int(a * buffer_size), int((z + 1) * buffer_size)) for a, z in zip(first, last)
+    )
+    return intervals, buffer_size
 
 
 def get_sync_line_for_stim_onset(
@@ -1006,6 +1109,32 @@ class SyncDataset:
 
         return tuple(blocks)
 
+    @npc_io.cached_property
+    def invalid_intervals(self) -> tuple[tuple[float, float], ...]:
+        """(start, stop) times in seconds of each interval of sync data that is a replayed
+        copy of a later acquisition buffer. Empty if none are found.
+
+        Events in [start, stop) are not real on any line. The last buffer of each run of
+        identical buffers is assumed to be genuine and is not included. See
+        `find_replayed_buffers`.
+        """
+        events = self.get_all_events()
+        if self.meta_data["ni_daq"]["counter_bits"] == 32:
+            times = events[:, 0]
+        else:
+            times = self.times
+        intervals, buffer_size = find_replayed_buffers(times, events[:, -1])
+        result = tuple(
+            (a / self.sample_freq, z / self.sample_freq) for a, z in intervals
+        )
+        if result:
+            logger.warning(
+                f"{self}: {len(result)} interval(s) of replayed sync data with "
+                f"{buffer_size}-sample buffers (all lines invalid): "
+                f"{[(round(a, 3), round(z, 3)) for a, z in result]}"
+            )
+        return result
+
     @property
     def total_seconds(self) -> float:
         return self.meta_data["total_samples"] / self.sample_freq
@@ -1131,7 +1260,17 @@ class SyncDataset:
 
     @npc_io.cached_property
     def frame_display_time_blocks(self) -> tuple[npt.NDArray[np.floating], ...]:
-        """Blocks of adjusted diode times: one block per stimulus."""
+        """Blocks of adjusted diode times: one block per stimulus.
+
+        Raises `AssertionError` if the sync file contains replayed data (see
+        `invalid_intervals`), since vsync and diode edges can't be trusted there.
+        """
+        if self.invalid_intervals:
+            raise AssertionError(
+                f"{self} contains replayed sync data (all lines invalid) at "
+                + ", ".join(f"{a:.3f}-{z:.3f} s" for a, z in self.invalid_intervals)
+                + ": frame display times can't be computed reliably"
+            )
         vsync_times_in_blocks = self.vsync_times_in_blocks
 
         diode_rising_edges = self.get_rising_edges("stim_photodiode", units="seconds")
