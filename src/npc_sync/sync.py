@@ -68,6 +68,11 @@ REPLAY_SLOT_SAMPLES = 10_000
 acquisition buffers. Buffer sizes seen so far (50,000 and 10,000 samples) are multiples
 of this. Buffer size is not recorded in the sync file metadata."""
 
+REPLAY_MAX_BUFFER_SAMPLES = 50_000
+"""Largest acquisition buffer (0.5 s at 100 kHz) considered when looking for replayed
+buffers. Identical slots separated by more than this are coincidental matches (e.g. quiet
+or periodic stretches of real data) and are ignored."""
+
 SUSPICIOUS_INTERVAL_THRESHOLD = 0.3 / FRAME_RATE
 DEFINITE_SHORT_INTERVAL_THRESHOLD = 0.05 / FRAME_RATE
 # at 60 fps we should never have diode-flip intervals this small: consider them anomalous
@@ -175,6 +180,7 @@ def find_replayed_buffers(
     times: npt.ArrayLike,
     bits: npt.ArrayLike,
     slot_samples: int = REPLAY_SLOT_SAMPLES,
+    max_buffer_samples: int = REPLAY_MAX_BUFFER_SAMPLES,
 ) -> tuple[tuple[tuple[int, int], ...], int | None]:
     """Find acquisition buffers in a sync event list that are replayed copies of a later
     buffer.
@@ -197,6 +203,8 @@ def find_replayed_buffers(
         Bit state (all lines) of each event.
     slot_samples : int
         Fingerprint slot width in samples. Must divide the buffer size.
+    max_buffer_samples : int
+        Identical slots further apart than this are not treated as replays.
 
     Returns
     -------
@@ -238,6 +246,10 @@ def find_replayed_buffers(
         return (), None
     earlier = slots[:-1][same]
     lags = slots[1:][same] - earlier
+    plausible = lags <= max_buffer_samples // slot_samples
+    earlier, lags = earlier[plausible], lags[plausible]
+    if lags.size == 0:
+        return (), None
     values, counts = np.unique(lags, return_counts=True)
     lag = int(values[np.argmax(counts)])
     if len(values) > 1:

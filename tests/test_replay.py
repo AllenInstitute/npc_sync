@@ -94,3 +94,13 @@ def test_known_sessions(session: str) -> None:
     if not paths:
         pytest.skip(f"local sync file not available for {session}")
     assert npc_sync.SyncDataset(paths[0]).invalid_intervals == KNOWN[session]
+
+
+def test_ignores_identical_slots_beyond_max_buffer_size() -> None:
+    rng = np.random.default_rng(1)
+    rel = np.sort(rng.choice(10_000, 50, replace=False))
+    state = rng.integers(0, 2**32, 50)
+    # same slot content 31 slots (310,000 samples) apart: not a plausible buffer
+    times = np.concatenate([rel, rel + 310_000])
+    bits = np.concatenate([state, state])
+    assert npc_sync.sync.find_replayed_buffers(times, bits) == ((), None)
