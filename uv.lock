@@ -2169,7 +2169,7 @@ wheels = [
 
 [[package]]
 name = "npc-sync"
-version = "0.2.8"
+version = "0.2.9"
 source = { editable = "." }
 default-groups = ["bump", "linting", "task-runner", "testing"]
 dependencies = [
