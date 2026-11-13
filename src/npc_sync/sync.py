@@ -247,7 +247,9 @@ def find_replayed_buffers(
             f"{dict(zip(values.tolist(), counts.tolist()))}. Using the most common ({lag})."
         )
     buffer_size = lag * slot_samples
-    copies = np.unique(earlier[lags == lag] // lag)  # buffer index of each replayed copy
+    copies = np.unique(
+        earlier[lags == lag] // lag
+    )  # buffer index of each replayed copy
     breaks = np.flatnonzero(np.diff(copies) != 1)
     first = copies[np.r_[0, breaks + 1]]
     last = copies[np.r_[breaks, len(copies) - 1]]
