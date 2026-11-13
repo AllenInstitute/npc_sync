@@ -73,6 +73,19 @@ REPLAY_MAX_BUFFER_SAMPLES = 50_000
 buffers. Identical slots separated by more than this are coincidental matches (e.g. quiet
 or periodic stretches of real data) and are ignored."""
 
+BARCODE_MIN_GAP_SEC = 20.0
+"""Rising edges on the barcode line separated by more than this start a new barcode.
+Barcodes are emitted every ~31 s and last <2 s."""
+
+BARCODE_MAX_DURATION_SEC = 2.0
+"""Upper bound on the duration of one barcode (observed 0.68-1.82 s). Used as the margin around
+the recording edges (truncated barcodes) and around invalid intervals."""
+
+BARCODE_INTERVAL_TOLERANCE_SEC = 0.010
+"""Largest deviation of a barcode onset interval from its per-file median (or an integer
+multiple of it, if barcodes were excluded in between) that is still considered regular.
+Observed on 6 clean files: <= 0.31 ms."""
+
 SUSPICIOUS_INTERVAL_THRESHOLD = 0.3 / FRAME_RATE
 DEFINITE_SHORT_INTERVAL_THRESHOLD = 0.05 / FRAME_RATE
 # at 60 fps we should never have diode-flip intervals this small: consider them anomalous
@@ -269,6 +282,81 @@ def find_replayed_buffers(
         (int(a * buffer_size), int((z + 1) * buffer_size)) for a, z in zip(first, last)
     )
     return intervals, buffer_size
+
+
+def find_barcode_discontinuities(
+    barcode_rising_edges: npt.ArrayLike,
+    total_seconds: float,
+    invalid_intervals: Sequence[tuple[float, float]] = (),
+    tolerance: float = BARCODE_INTERVAL_TOLERANCE_SEC,
+) -> tuple[tuple[float, float, float], ...]:
+    """Find intervals between barcode onsets that are not a whole number of barcode periods:
+    sync data was dropped (negative shift) or inserted (positive shift) somewhere in between,
+    on every line at once.
+
+    Barcodes are generated at a fixed period, so onset intervals are regular to well under 1 ms
+    (max 0.31 ms seen). A dropped 0.5 s buffer with no gap in sample numbers shortens one
+    interval by exactly 0.5 s and shifts all later events early.
+
+    Only barcodes that can be trusted are used:
+
+    - the first barcode is excluded if it starts within `BARCODE_MAX_DURATION_SEC` of the
+      recording start, and the last if it ends (start + max duration) after the recording end:
+      either may be truncated
+    - barcodes within `BARCODE_MAX_DURATION_SEC` of an invalid (replayed) interval are excluded
+      (their edges may be copies, or only partly present)
+
+    Intervals spanning excluded barcodes are compared with the nearest integer multiple of the
+    period. Files with fewer than 4 usable barcodes (or no barcode line) return ().
+
+    Returns
+    -------
+    tuple of (start, stop, shift)
+        Seconds. The drop/insertion happened somewhere between consecutive usable barcode onsets
+        `start` and `stop`; events at `stop` or later are shifted by `shift` (negative: recorded
+        early, i.e. data is missing). Treat [start, stop] as invalid on all lines, and every
+        event after it as shifted unless corrected.
+
+    Examples
+    --------
+    >>> onsets = np.arange(10) * 31.0 + 5.0
+    >>> find_barcode_discontinuities(onsets, 400.0)
+    ()
+    >>> dropped = np.r_[onsets[:5], onsets[5:] - 1.0]  # 1 s dropped before barcode 5
+    >>> find_barcode_discontinuities(dropped, 400.0)
+    ((129.0, 159.0, -1.0),)
+
+    Truncated first and last barcodes are ignored:
+    >>> find_barcode_discontinuities(np.r_[0.5, onsets[1:-1], 398.5], 399.0)
+    ()
+    """
+    on = np.sort(np.asarray(barcode_rising_edges, dtype=float))
+    if on.size == 0:
+        return ()
+    starts = on[np.r_[True, np.diff(on) > BARCODE_MIN_GAP_SEC]]
+    keep = (starts >= BARCODE_MAX_DURATION_SEC) & (
+        starts + BARCODE_MAX_DURATION_SEC <= total_seconds
+    )
+    for a, z in invalid_intervals:
+        keep &= ~(
+            (starts + BARCODE_MAX_DURATION_SEC > a)
+            & (starts - BARCODE_MAX_DURATION_SEC < z)
+        )
+    starts = starts[keep]
+    if starts.size < 4:  # need >= 3 intervals for a meaningful median
+        return ()
+    intervals = np.diff(starts)
+    # the shortest intervals are between adjacent usable barcodes; a dropped buffer shortens
+    # one by <= a few seconds, so anchor the period on the median of the minimum-multiple ones
+    approx = np.min(intervals)
+    multiples = np.maximum(np.round(intervals / approx), 1)
+    period = float(np.median(intervals[multiples == 1]))
+    multiples = np.maximum(np.round(intervals / period), 1)
+    deviation = intervals - multiples * period
+    return tuple(
+        (float(starts[i]), float(starts[i + 1]), float(deviation[i]))
+        for i in np.flatnonzero(np.abs(deviation) > tolerance)
+    )
 
 
 def get_sync_line_for_stim_onset(
@@ -1149,6 +1237,42 @@ class SyncDataset:
             )
         return result
 
+    @npc_io.cached_property
+    def timebase_discontinuities(self) -> tuple[tuple[float, float, float], ...]:
+        """(start, stop, shift) in seconds for each interval between consecutive barcode onsets
+        that is not a whole number of barcode periods: sync data was dropped (shift < 0) or
+        inserted (shift > 0) somewhere in [start, stop], on all lines at once. Events after
+        `stop` are shifted by `shift` relative to true time.
+
+        Empty if none are found, or if the file has no barcode line / fewer than 4 usable
+        barcodes (in which case nothing can be said: check `has_barcodes`). Barcodes that may be
+        truncated by the start/end of the recording, or that overlap `invalid_intervals`, are not
+        used. See `find_barcode_discontinuities`.
+        """
+        if not self.has_barcodes:
+            return ()
+        result = find_barcode_discontinuities(
+            self.get_rising_edges("barcode_ephys", units="seconds"),
+            total_seconds=self.total_seconds,
+            invalid_intervals=self.invalid_intervals,
+        )
+        if result:
+            logger.warning(
+                f"{self}: {len(result)} timebase discontinuity(ies) from barcode onset intervals "
+                f"(all lines affected, events after are shifted): "
+                f"{[(round(a, 2), round(z, 2), round(d, 3)) for a, z, d in result]}"
+            )
+        return result
+
+    @property
+    def has_barcodes(self) -> bool:
+        """Whether the file has a barcode line with events (without it, timebase
+        discontinuities can't be detected from barcodes)."""
+        return (
+            "barcode_ephys" in self.line_labels
+            and self.get_rising_edges("barcode_ephys").size > 0
+        )
+
     @property
     def total_seconds(self) -> float:
         return self.meta_data["total_samples"] / self.sample_freq
@@ -1277,12 +1401,22 @@ class SyncDataset:
         """Blocks of adjusted diode times: one block per stimulus.
 
         Raises `AssertionError` if the sync file contains replayed data (see
-        `invalid_intervals`), since vsync and diode edges can't be trusted there.
+        `invalid_intervals`) or a timebase discontinuity (see `timebase_discontinuities`), since vsync and diode edges can't be trusted there.
         """
         if self.invalid_intervals:
             raise AssertionError(
                 f"{self} contains replayed sync data (all lines invalid) at "
                 + ", ".join(f"{a:.3f}-{z:.3f} s" for a, z in self.invalid_intervals)
+                + ": frame display times can't be computed reliably"
+            )
+        if self.timebase_discontinuities:
+            raise AssertionError(
+                f"{self} has a timebase discontinuity (all lines affected, later events shifted) "
+                "between barcode onsets at "
+                + ", ".join(
+                    f"{a:.3f}-{z:.3f} s ({d:+.3f} s)"
+                    for a, z, d in self.timebase_discontinuities
+                )
                 + ": frame display times can't be computed reliably"
             )
         vsync_times_in_blocks = self.vsync_times_in_blocks
