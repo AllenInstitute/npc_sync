@@ -8,9 +8,13 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 <!-- insertion marker -->
 ## Unreleased
 
-<small>[Compare with latest](https://github.com/AllenInstitute/npc_sync/compare/v0.2.6...HEAD)</small>
+<small>[Compare with latest](https://github.com/AllenInstitute/npc_sync/compare/v0.2.7...HEAD)</small>
 
 <!-- insertion marker -->
+## [v0.2.7](https://github.com/AllenInstitute/npc_sync/releases/tag/v0.2.7) - 2026-11-13
+
+<small>[Compare with v0.2.6](https://github.com/AllenInstitute/npc_sync/compare/v0.2.6...v0.2.7)</small>
+
 ## [v0.2.6](https://github.com/AllenInstitute/npc_sync/releases/tag/v0.2.6) - 2026-09-30
 
 <small>[Compare with v0.2.5](https://github.com/AllenInstitute/npc_sync/compare/v0.2.5...v0.2.6)</small>
