@@ -9,6 +9,13 @@ import logging
 # import functions from submodules here:
 from npc_sync.sync import *
 
+
+def __getattr__(name: str):
+    # deprecated names that moved to npc_stim (see npc_sync.sync.__getattr__)
+    import npc_sync.sync
+
+    return npc_sync.sync.__getattr__(name)
+
 logger = logging.getLogger(__name__)
 
 __version__ = importlib.metadata.version("npc_sync")

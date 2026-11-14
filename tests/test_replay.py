@@ -68,14 +68,6 @@ def test_trailing_event_difference() -> None:
     assert intervals == ((10 * buffer_size, 12 * buffer_size),)
 
 
-def test_frame_display_time_blocks_fails_fast_on_replay() -> None:
-    sync = object.__new__(npc_sync.SyncDataset)
-    sync.path = pathlib.Path("replayed.h5")
-    sync.invalid_intervals = ((5247.5, 5257.0),)
-    with pytest.raises(AssertionError, match="5247.500-5257.000 s"):
-        _ = sync.frame_display_time_blocks
-
-
 DATA = pathlib.Path(__file__).parents[1] / "experiments" / "vsync-frame-count" / "data"
 KNOWN = {
     "DRpilot_836629_20260430": ((5247.5, 5257.0),),

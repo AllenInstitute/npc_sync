@@ -13,6 +13,7 @@ import datetime
 import io
 import logging
 import os
+import warnings
 from collections.abc import Iterable, Sequence
 from typing import TYPE_CHECKING, Any, Literal, Union
 
@@ -21,7 +22,6 @@ import npc_io
 import npc_session
 import numpy as np
 import numpy.typing as npt
-import scipy.signal
 import upath
 from typing_extensions import Self, TypeAlias
 
@@ -29,8 +29,6 @@ if TYPE_CHECKING:
     import matplotlib.axes
     import matplotlib.figure
 
-
-import npc_stim
 
 logger = logging.getLogger(__name__)
 
@@ -44,25 +42,6 @@ FIRST_GALVO_ON_SYNC_DATE = datetime.date(2024, 4, 19)
 """Prior to this date, opto experiments using the galvo system did not have a "galvo motor
 running" signal, on any rig. A copy of the analog signal may have been recorded on the OpenEphys DAQ."""
 
-MONITOR_CENTER_REFRESH_TIME = 0.008
-"""Best estimate of time from photodiode flip (at top of screen) to updated
-content at the center of the screen. Screen refreshes in stages from top to bottom,
-in 16 ms: measured by Corbett."""
-
-AVERAGE_VSYNC_TO_DIODE_FLIP_TIME = 0.01955  #! sometimes shifts to ~0.035
-
-CONSTANT_MONITOR_LAG: float = (
-    MONITOR_CENTER_REFRESH_TIME + AVERAGE_VSYNC_TO_DIODE_FLIP_TIME
-)
-"""Best estimate of the average time between vsync falling edge and the center of
-the screen updating, in seconds. For use when a reliable photodiode signal
-is unavailable."""
-
-MIN_VSYNC_DIODE_FLIP_SEPARATION_SEC = 0.015  # 0.022 is typical
-
-FRAME_RATE = 59.95
-FRAME_INTERVAL = 1 / FRAME_RATE
-# we've seen apparently real flip intervals of 0.29 * 59.95, and the line between anomalous and real isn't clear-cut
 REPLAY_SLOT_SAMPLES = 10_000
 """Slot width, in samples, used to fingerprint sync events when looking for replayed
 acquisition buffers. Buffer sizes seen so far (50,000 and 10,000 samples) are multiples
@@ -85,20 +64,6 @@ BARCODE_INTERVAL_TOLERANCE_SEC = 0.010
 """Largest deviation of a barcode onset interval from its per-file median (or an integer
 multiple of it, if barcodes were excluded in between) that is still considered regular.
 Observed on 6 clean files: <= 0.31 ms."""
-
-SUSPICIOUS_INTERVAL_THRESHOLD = 0.3 / FRAME_RATE
-DEFINITE_SHORT_INTERVAL_THRESHOLD = 0.05 / FRAME_RATE
-# at 60 fps we should never have diode-flip intervals this small: consider them anomalous
-
-
-def get_plot_dir(mkdir: bool = False) -> upath.UPath | None:
-    if (p := os.environ.get("SYNC_PLOT_DIR", None)) is None:
-        return None
-    path = upath.UPath(p).resolve()
-    if mkdir:
-        path.mkdir(parents=True, exist_ok=True)
-    return path
-
 
 def get_sync_data(sync_path_or_data: SyncPathOrDataset) -> SyncDataset:
     """Open a path or file-like object and return a SyncDataset object."""
@@ -420,6 +385,8 @@ class SyncDataset:
     """
 
     stim_paths: tuple[upath.UPath, ...] | None
+    """Deprecated: only used by the deprecated display-time members, which moved to
+    npc_stim (pass stim paths to `npc_stim.get_display_times` instead)."""
 
     def __init__(
         self,
@@ -507,12 +474,16 @@ class SyncDataset:
         self._check_vsyncs()
 
     def _check_stim_photodiode(self) -> None:
+        """Diode flip-rate check, now in `npc_stim.check_stim_photodiode`: skipped with a
+        warning if npc_stim isn't installed."""
         try:
-            _ = self.expected_diode_flip_rate
-        except ValueError as exc:
-            raise AssertionError(
-                "Frame rate estimated from diode flips is abnormal."
-            ) from exc
+            npc_stim = _npc_stim()
+        except ImportError:
+            logger.warning(
+                "npc_stim not installed: skipping photodiode flip-rate check (moved to npc_stim.check_stim_photodiode)"
+            )
+            return
+        npc_stim.check_stim_photodiode(self)
 
     def _check_vsyncs(self) -> None:
         try:
@@ -1313,19 +1284,6 @@ class SyncDataset:
         return tuple(vsync_times_in_blocks)
 
     @npc_io.cached_property
-    def expected_diode_flip_rate(self) -> int:
-        """Best-guess at what the diode flip period should be, e.g. 1 s for
-        MPE/pipeline recordings, 1/60 s for Sam's TaskControl scripts."""
-        med = np.median(
-            np.diff(self.get_edges("all", "stim_photodiode", units="seconds"))
-        )
-        diode_assymmetry = 0.05  # s
-        for period in (1 / 60, 1):
-            if 0.9 * period - diode_assymmetry < med < 1.1 * period + diode_assymmetry:
-                return int(1 / period)
-        raise ValueError(f"Unexpected diode flip period: {med} sec")
-
-    @npc_io.cached_property
     def expected_frame_display_rate(self) -> int:
         """Best-guess at what the screen display rate should be. Currently
         [2023] should only be 60 fps."""
@@ -1335,381 +1293,111 @@ class SyncDataset:
                 return int(1 / period)
         raise ValueError(f"Unexpected vsync period: {med} sec")
 
-    @npc_io.cached_property
-    def is_block_using_diode(self) -> tuple[bool, ...]:
-        if getattr(self, "_blocks_using_diode", None) is None:
-            _ = self.frame_display_time_blocks
-        return self._blocks_using_diode
+    def get_edges_in_blocks(
+        self,
+        line: str | int,
+        edge: Literal["rising", "falling"],
+        end_padding: float = 0.0,
+    ) -> tuple[npt.NDArray[np.floating], ...]:
+        """Rising or falling edge times on `line` (seconds), divided into blocks, one per
+        stimulus.
 
-    @npc_io.cached_property
-    def block_index_to_stim_path(self) -> dict[int, upath.UPath | None]:
+        - with a stim_running signal: one block per stim_running high period, extended by
+          `end_padding` seconds after the falling edge (see
+          `divide_into_stim_running_blocks`)
+        - without: split at gaps > 1 s (see `reshape_into_blocks`)
+
+        The number of blocks isn't guaranteed to match `vsync_times_in_blocks`.
+        """
+        if edge == "rising":
+            edges = self.get_rising_edges(line, units="seconds")
+        elif edge == "falling":
+            edges = self.get_falling_edges(line, units="seconds")
+        else:
+            raise ValueError(f"edge must be 'rising' or 'falling', got {edge!r}")
+        if self.stim_running_edges[0].size > 0:  # has stim running signal
+            return self.divide_into_stim_running_blocks(edges, end_padding=end_padding)
+        return reshape_into_blocks(
+            self.filter_on_stim_running(edges, end_padding=end_padding),
+            min_gap=1.0,
+        )
+
+    # deprecated: moved to npc_stim ------------------------------------------- #
+
+    def _deprecated_stim_paths(self) -> tuple[upath.UPath, ...]:
         if self.stim_paths is None:
             logger.warning(
                 "getting all hdf5 files available in same folder as sync file: pass a list on init to use specific files"
             )
             self.stim_paths = tuple(upath.UPath(self.path).parent.glob("*.hdf5"))
-        return npc_stim.get_stim_block_to_path(
-            stim_paths=self.stim_paths,
-            sync_data=self,
-        )
+        return self.stim_paths
 
     @npc_io.cached_property
-    def expected_vsyncs_per_block(self) -> dict[int, int | None]:
-        result = {}
-        for block_idx, path in self.block_index_to_stim_path.items():
-            if path is None:
-                result[block_idx] = None
-                continue
-            try:
-                stim_data = npc_stim.get_stim_data(path)
-            except Exception as exc:
-                logger.warning(
-                    f"Failed to load stim data for block {block_idx} at {path}: {exc}"
-                )
-                result[block_idx] = None
-                continue
-            result[block_idx] = npc_stim.get_total_stim_frames(stim_data)
-        return result
-
-    def _get_diode_box_frame_interval(self, block_idx: int) -> int:
-        """Return the number of frames between diode-box flips for a block.
-
-        Stim files created before ``diodeBoxFrameInterval`` was added always
-        flipped the diode box every frame, so missing metadata defaults to 1.
-        """
-        path = self.block_index_to_stim_path[block_idx]
-        if path is None:
-            return 1
-        stim_data = None
-        try:
-            stim_data = npc_stim.get_stim_data(path)
-            value = stim_data.get("diodeBoxFrameInterval", 1)
-            if isinstance(value, h5py.Dataset):
-                value = value[()]
-            return int(value)
-        except Exception as exc:
-            logger.warning(
-                f"Failed to load diodeBoxFrameInterval for block {block_idx} at {path}: {exc}"
-            )
-            return 1
-        finally:
-            if isinstance(stim_data, h5py.File):
-                stim_data.close()
-
-    @npc_io.cached_property
-    def frame_display_time_blocks(self) -> tuple[npt.NDArray[np.floating], ...]:
-        """Blocks of adjusted diode times: one block per stimulus.
-
-        Raises `AssertionError` if the sync file contains replayed data (see
-        `invalid_intervals`) or a timebase discontinuity (see `timebase_discontinuities`), since vsync and diode edges can't be trusted there.
-        """
-        if self.invalid_intervals:
-            raise AssertionError(
-                f"{self} contains replayed sync data (all lines invalid) at "
-                + ", ".join(f"{a:.3f}-{z:.3f} s" for a, z in self.invalid_intervals)
-                + ": frame display times can't be computed reliably"
-            )
-        if self.timebase_discontinuities:
-            raise AssertionError(
-                f"{self} has a timebase discontinuity (all lines affected, later events shifted) "
-                "between barcode onsets at "
-                + ", ".join(
-                    f"{a:.3f}-{z:.3f} s ({d:+.3f} s)"
-                    for a, z, d in self.timebase_discontinuities
-                )
-                + ": frame display times can't be computed reliably"
-            )
-        vsync_times_in_blocks = self.vsync_times_in_blocks
-
-        diode_rising_edges = self.get_rising_edges("stim_photodiode", units="seconds")
-        diode_falling_edges = self.get_falling_edges("stim_photodiode", units="seconds")
-        assert abs(len(diode_rising_edges) - len(diode_falling_edges)) < 2
-        end_padding = 10 * FRAME_INTERVAL
-        if self.stim_running_edges[0].size > 0:  # has stim running signal
-            diode_rising_edges_in_blocks = self.divide_into_stim_running_blocks(
-                diode_rising_edges, end_padding=end_padding
-            )
-            diode_falling_edges_in_blocks = self.divide_into_stim_running_blocks(
-                diode_falling_edges, end_padding=end_padding
-            )
-        else:
-            diode_rising_edges_in_blocks = reshape_into_blocks(
-                self.filter_on_stim_running(
-                    diode_rising_edges, end_padding=end_padding
-                ),
-                min_gap=1.0,
-            )
-            diode_falling_edges_in_blocks = reshape_into_blocks(
-                self.filter_on_stim_running(
-                    diode_falling_edges, end_padding=end_padding
-                ),
-                min_gap=1.0,
-            )
-
-        if any(
-            len(diode_edge_blocks) < len(vsync_times_in_blocks)
-            for diode_edge_blocks in (
-                diode_rising_edges_in_blocks,
-                diode_falling_edges_in_blocks,
-            )
-        ):
-            # too few blocks of diode flips - affected some early DRPilot
-            # sessions with near-constant diode flips between stimulus
-            # blocks, and no stim-running signal to filter them
-
-            # - vsyncs necessarily precede diode flips
-            # - split existing diode flip blocks at the first vsync time for
-            #   each vsync block
-            # - we'll clean up any excess diode flips at the end of the block later
-            # to see the problem compare these two lists:
-            # [(v[0], v[-1]) for v in vsync_times_in_blocks]
-            # [(v[0], v[-1]) for v in diode_falling_edges_in_blocks]
-            for v_start in (v[0] for v in vsync_times_in_blocks):
-                assert len(diode_rising_edges_in_blocks) == len(
-                    diode_falling_edges_in_blocks
-                )
-                new_rising_edges: list[npt.NDArray] = []
-                new_falling_edges: list[npt.NDArray] = []
-                for d_idx, (d_start, d_stop) in enumerate(
-                    (d[0], d[-1]) for d in diode_falling_edges_in_blocks
-                ):
-                    if d_start < v_start < d_stop and (
-                        split := np.searchsorted(
-                            diode_falling_edges_in_blocks[d_idx], v_start
-                        )
-                    ) not in (0, len(diode_falling_edges_in_blocks[d_idx])):
-                        for new, old in zip(
-                            (new_rising_edges, new_falling_edges),
-                            (
-                                diode_rising_edges_in_blocks[d_idx],
-                                diode_falling_edges_in_blocks[d_idx],
-                            ),
-                        ):
-                            new.extend((old[:split], old[split:]))
-                    else:
-                        for new, old in zip(
-                            (new_rising_edges, new_falling_edges),
-                            (
-                                diode_rising_edges_in_blocks[d_idx],
-                                diode_falling_edges_in_blocks[d_idx],
-                            ),
-                        ):
-                            new.append(old)
-                diode_rising_edges_in_blocks, diode_falling_edges_in_blocks = (
-                    tuple(new_rising_edges),
-                    tuple(new_falling_edges),
-                )
-
-        if any(
-            len(diode_edge_blocks) > len(vsync_times_in_blocks)
-            for diode_edge_blocks in (
-                diode_rising_edges_in_blocks,
-                diode_falling_edges_in_blocks,
-            )
-        ):
-            # more blocks of diode flips than blocks of vsyncs
-            def is_mismatch(edges, block) -> bool:
-                return edges[-1] < block[0]
-
-            for idx, vsync_block in enumerate(vsync_times_in_blocks):
-                # work through blocks in order,
-                # discard blocks with diode flips that don't match any vsyncs
-                while is_mismatch(diode_rising_edges_in_blocks[idx], vsync_block):
-                    diode_rising_edges_in_blocks = tuple(
-                        block
-                        for i, block in enumerate(diode_rising_edges_in_blocks)
-                        if i != idx
-                    )
-                while is_mismatch(diode_falling_edges_in_blocks[idx], vsync_block):
-                    diode_falling_edges_in_blocks = tuple(
-                        block
-                        for i, block in enumerate(diode_falling_edges_in_blocks)
-                        if i != idx
-                    )
-
-        frame_display_time_blocks: list[npt.NDArray[np.floating] | None] = []
-        blocks_using_diode = [True] * len(vsync_times_in_blocks)
-        for block_idx, (vsyncs, rising, falling) in enumerate(
-            zip(
-                vsync_times_in_blocks,
-                diode_rising_edges_in_blocks,
-                diode_falling_edges_in_blocks,
-            )
-        ):
-
-            #! decide how to toggle this: env var?
-            fallback_or_none: npt.NDArray[np.floating] | None = (
-                self.constant_lag_frame_display_time_blocks[block_idx]
-                if os.getenv("SYNC_FALLBACK_CONSTANT_LAG")
-                else None
-            )
-
-            # keep flips after first vsync + an empirically determined min latency
-            # between vsync and screen update
-            falling = falling[
-                falling > (vsyncs[0] + MIN_VSYNC_DIODE_FLIP_SEPARATION_SEC)
-            ]
-            rising = rising[rising > (vsyncs[0] + MIN_VSYNC_DIODE_FLIP_SEPARATION_SEC)]
-
-            # keep flips only up to a certain time after the last vsync
-            MAX_VSYNC_DIODE_FLIP_SEPARATION_SEC = 5 / FRAME_RATE
-            falling = falling[
-                falling < (vsyncs[-1] + MAX_VSYNC_DIODE_FLIP_SEPARATION_SEC)
-            ]
-            rising = rising[rising < (vsyncs[-1] + MAX_VSYNC_DIODE_FLIP_SEPARATION_SEC)]
-
-            is_first_frame_on = rising[0] < falling[0]  # may be updated below
-
-            def concat_flips(rising, falling):
-                """Concatenate the rising and falling edges into a single array."""
-                return np.sort(np.concatenate((rising, falling)))
-
-            vsyncs_per_diode_flip = self._get_diode_box_frame_interval(block_idx)
-
-            if (
-                vsyncs_per_diode_flip == 1
-                and self.expected_vsyncs_per_block.get(block_idx, None) is None
-            ):
-                logger.warning(
-                    f"Block {block_idx} has no stim file available to verify number of vsyncs - ensure stim files are in same dir as sync file when sync square flips on every frame"
-                )
-                # we could fail here, but it's extremely rare that the number of vsyncs is different
-                # to the number of frames in the stim file, and we always intend to have stim files available
-
-            if vsyncs_per_diode_flip == 1 and self.expected_vsyncs_per_block[
-                block_idx
-            ] != len(vsyncs):
-                logger.warning(
-                    f"Block {block_idx} has {len(vsyncs)} vsyncs, expected "
-                    f"{self.expected_vsyncs_per_block[block_idx]} from stim file: Skipping"
-                )
-                frame_display_time_blocks.append(fallback_or_none)
-                blocks_using_diode[block_idx] = False
-                continue
-
-            def split_flips(concat_flips, is_first_frame_on):
-                """Split the concatenated flips into rising and falling edges."""
-                on = concat_flips[::2]
-                off = concat_flips[1::2]
-                if is_first_frame_on:
-                    return (on, off)
-                else:
-                    return (off, on)
-
-            flips = concat_flips(rising, falling)
-            while any(anomalous_interval_indices(flips, vsyncs_per_diode_flip)):
-
-                indices = anomalous_interval_indices(flips, vsyncs_per_diode_flip)
-                # just delete one interval then check again:
-                logger.warning(
-                    f"Removing anomalous short diode interval in block {block_idx}"
-                )
-                flips = np.delete(flips, slice(indices[0], indices[0] + 2))
-                if 0 in indices:
-                    is_first_frame_on = not is_first_frame_on
-
-            if vsyncs_per_diode_flip == 1 and np.abs(len(flips) - len(vsyncs)) > 5:
-                logger.warning(
-                    f"Block {block_idx} has {len(flips)} diode flips (after basic filtering), "
-                    f"but {len(vsyncs)} vsyncs: Skipping"
-                )
-                frame_display_time_blocks.append(fallback_or_none)
-                blocks_using_diode[block_idx] = False
-                continue
-
-            rising, falling = split_flips(flips, is_first_frame_on)
-
-            if self.block_index_to_stim_path[block_idx] is None and os.getenv(
-                "SYNC_ALLOW_MISSING_STIM_FILES"
-            ):
-                logger.debug(
-                    f"Block {block_idx} has no stim file available to verify number of vsyncs. Skipping."
-                )
-                frame_display_time_blocks.append(fallback_or_none)
-                continue
-            assert self.block_index_to_stim_path[block_idx] is not None
-
-            # script_frame_intervals = h5py.File(self.block_index_to_stim_path[block_idx])['frameIntervals'][:]
-
-            stim_id = f"{self.block_index_to_stim_path[block_idx].parent.name}_{block_idx}_{self.block_index_to_stim_path[block_idx].stem}"
-
-            try:
-                times = get_frame_display_times(
-                    vsync_times=vsyncs,
-                    on_flip_times=rising,
-                    off_flip_times=falling,
-                    vsyncs_per_flip=vsyncs_per_diode_flip,
-                    adjust_dropped_frames=True,
-                    check_lengths=False,
-                    check_vsyncs=True,
-                    stim_id=stim_id,
-                )
-            except (AssertionError, IndexError):
-                if os.environ.get("SYNC_DEBUG", None):
-                    raise
-                logger.exception(
-                    f"Failed to get correct frame display times for {stim_id} block {block_idx}."
-                    + (
-                        "Using vsync times + constant lag"
-                        if fallback_or_none is not None
-                        else "No frame display times will be available"
-                    )
-                )
-                frame_display_time_blocks.append(fallback_or_none)
-                blocks_using_diode[block_idx] = False
-                continue
-
-            if vsyncs_per_diode_flip == 1:
-                while len(times) < len(vsyncs):
-                    if len(vsyncs) - len(times) > 3:
-                        raise AssertionError(
-                            f"{stim_id}: Block {block_idx} has {len(times)} frame display times, "
-                            f"but {len(vsyncs)} vsyncs: too many missing frames"
-                        )
-                    times = add_missing_diode_flips_for_truncated_sync(times, vsyncs)
-
-                if (len(times) == len(vsyncs) + 1) and times[-1] > vsyncs[-1] + (
-                    times[:-1] - vsyncs
-                ).mean():
-                    # special case where we have an extra flip at the end, which doesn't correspond to a vsync
-                    # - can happen if the last frame's sync square is high and the screen then returns to black
-                    times = times[:-1]
-                if len(times) - len(vsyncs) < 5:
-                    # if we have a few more frames than vsyncs, we can assume these are just extra frames
-                    # at the end of the block caused by spontaneous flicker, so we remove them
-                    times = times[: len(vsyncs)]
-                if len(times) != len(vsyncs):
-                    logger.error(
-                        f"{stim_id}: Block {block_idx} has {len(times)} frame display times, "
-                        f"but {len(vsyncs)} vsyncs"
-                    )
-                    frame_display_time_blocks.append(fallback_or_none)
-                    blocks_using_diode[block_idx] = False
-                    continue
-
-            frame_display_time_blocks.append(times + MONITOR_CENTER_REFRESH_TIME)
-            logger.info(
-                f"Added frame display times for {self.block_index_to_stim_path[block_idx]}"
-            )
-            continue
-
-        assert (
-            len(frame_display_time_blocks)
-            == len(self.vsync_times_in_blocks)
-            == len(blocks_using_diode)
+    def _deprecated_display_time_blocks(self) -> tuple[Any, ...]:
+        return _npc_stim().get_display_times(
+            self,
+            self._deprecated_stim_paths(),
+            fallback=(
+                "constant_lag" if os.getenv("SYNC_FALLBACK_CONSTANT_LAG") else None
+            ),
+            raise_on_error=bool(os.getenv("SYNC_DEBUG")),
         )
-        self._blocks_using_diode = tuple(blocks_using_diode)
-        return tuple(frame_display_time_blocks)
+
+    @property
+    def frame_display_time_blocks(
+        self,
+    ) -> tuple[npt.NDArray[np.floating] | None, ...]:
+        """Deprecated: use `npc_stim.get_display_times(sync, stim_paths)`.
+
+        Blocks of estimated frame display times: one block per stimulus (None where
+        unavailable). Stim files are those passed on init, or all .hdf5 files next to the
+        sync file.
+        """
+        _warn_moved("SyncDataset.frame_display_time_blocks", "get_display_times")
+        return tuple(b.display_times for b in self._deprecated_display_time_blocks)
+
+    @property
+    def is_block_using_diode(self) -> tuple[bool, ...]:
+        """Deprecated: use `BlockDisplayTimes.source` from `npc_stim.get_display_times`."""
+        _warn_moved("SyncDataset.is_block_using_diode", "get_display_times")
+        return tuple(b.is_photodiode for b in self._deprecated_display_time_blocks)
 
     @property
     def constant_lag_frame_display_time_blocks(
         self,
     ) -> tuple[npt.NDArray[np.floating], ...]:
-        """Blocks of vsync times + a constant: one block per stimulus. For use
-        when a reliable photodiode signal is unavailable."""
-        return tuple(
-            block + CONSTANT_MONITOR_LAG for block in self.vsync_times_in_blocks
+        """Deprecated: use `npc_stim.get_constant_lag_display_time_blocks`."""
+        _warn_moved(
+            "SyncDataset.constant_lag_frame_display_time_blocks",
+            "get_constant_lag_display_time_blocks",
         )
+        return _npc_stim().get_constant_lag_display_time_blocks(self)
+
+    @property
+    def expected_diode_flip_rate(self) -> int:
+        """Deprecated: use `npc_stim.get_expected_diode_flip_rate`."""
+        _warn_moved(
+            "SyncDataset.expected_diode_flip_rate", "get_expected_diode_flip_rate"
+        )
+        return _npc_stim().get_expected_diode_flip_rate(self)
+
+    @property
+    def block_index_to_stim_path(self) -> dict[int, upath.UPath | None]:
+        """Deprecated: use `npc_stim.get_stim_block_to_path`."""
+        _warn_moved("SyncDataset.block_index_to_stim_path", "get_stim_block_to_path")
+        return _npc_stim().get_stim_block_to_path(self._deprecated_stim_paths(), self)
+
+    @property
+    def expected_vsyncs_per_block(self) -> dict[int, int | None]:
+        """Deprecated: use `npc_stim.get_total_stim_frames` on the matched stim file."""
+        _warn_moved("SyncDataset.expected_vsyncs_per_block", "get_total_stim_frames")
+        npc_stim = _npc_stim()
+        return {
+            idx: None if path is None else npc_stim.get_total_stim_frames(path)
+            for idx, path in npc_stim.get_stim_block_to_path(
+                self._deprecated_stim_paths(), self
+            ).items()
+        }
 
     def plot_all(
         self,
@@ -1866,176 +1554,31 @@ class SyncDataset:
 
     @property
     def stim_offsets(self) -> npt.NDArray[np.floating]:
+        """stim_running falling edges, or the last vsync of each block if there is no
+        stim_running signal (until 0.2.9 this fell back to the last frame display time)."""
         if any(stim_running := self.get_falling_edges("stim_running", units="seconds")):
             return stim_running
-        return np.array([block[-1] for block in self.frame_display_time_blocks])
+        return np.array([block[-1] for block in self.vsync_times_in_blocks])
 
     def plot_stim_onsets(self) -> matplotlib.figure.Figure:
-        import matplotlib.pyplot as plt
-
-        # plot beginning of stims
-        fig, _ = plt.subplots(len(self.stim_onsets))
-        axes = fig.axes
-        fig.suptitle("Stim onsets")
-        for ind, (son, vs, dvs) in enumerate(
-            zip(
-                self.stim_onsets,
-                self.vsync_times_in_blocks,
-                self.frame_display_time_blocks,
-            )
-        ):
-            labels = []
-            axes[ind].plot(vs, 0.5 * np.ones(len(vs)), "|")
-            labels.append("stim vsyncs")
-            axes[ind].plot(dvs, 0.5 * np.ones(len(dvs)), "|", ms=20)
-            labels.append("frame display (estimated)")
-
-            # focus on the start of vsyncs if they occur well after the stim-TTL onset
-            x0, x1 = max(son - 1, vs[0] - 1), max(son + 2, vs[0] + 2)
-
-            self.plot_bit(4, x0, x1, axes=axes[ind], auto_show=False)
-            labels.append("diode-measured sync square")
-            self.plot_bit(5, x0, x1, axes=axes[ind], auto_show=False)
-            labels.append("stim running or ends of block")
-            axes[ind].set_xlim((x0, x1))
-            axes[ind].legend(
-                labels,
-                fontsize=8,
-                loc="upper center",
-                bbox_to_anchor=(0.5, 1.05),
-                ncol=len(labels),
-                fancybox=True,
-            )
-            if len(fig.axes) > 1:
-                axes[ind].set_title(f"visual stim {ind}", fontsize=8)
-                legend = axes[ind].get_legend()
-                if ind > 0 and legend is not None:
-                    legend.remove()
-        fig.set_size_inches(10, 5 * len(fig.axes))
-        fig.subplots_adjust(hspace=0.3)
-        return fig
+        """Deprecated: use `npc_stim.plot_stim_onsets(sync, npc_stim.get_display_times(...))`."""
+        _warn_moved("SyncDataset.plot_stim_onsets", "plot_stim_onsets")
+        return _npc_stim().plot_stim_onsets(self, self._deprecated_display_time_blocks)
 
     def plot_stim_offsets(self) -> matplotlib.figure.Figure:
-        import matplotlib.pyplot as plt
-
-        # plot end of stims
-        fig, _ = plt.subplots(len(self.stim_offsets))
-        axes = fig.axes
-
-        fig.suptitle("Stim offsets")
-        for ind, (soff, vs, dvs) in enumerate(
-            zip(
-                self.stim_offsets,
-                self.vsync_times_in_blocks,
-                self.frame_display_time_blocks,
-            )
-        ):
-            labels = []
-            axes[ind].plot(vs, 0.5 * np.ones(len(vs)), "|")
-            labels.append("stim vsyncs")
-            axes[ind].plot(dvs, 0.5 * np.ones(len(dvs)), "|", ms=20)
-            labels.append("frame display (estimated)")
-
-            # focus on the end of vsyncs if they occur well before the stim-TTL offset
-            x0, x1 = min(soff - 2, vs[-1] - 2), min(soff + 1, vs[-1] + 1)
-
-            self.plot_bit(4, x0, x1, axes=axes[ind], auto_show=False)
-            labels.append("diode-measured sync square")
-            self.plot_bit(5, x0, x1, axes=axes[ind], auto_show=False)
-            labels.append("stim running or ends of block")
-            axes[ind].set_xlim((x0, x1))
-            axes[ind].legend(
-                labels,
-                fontsize=8,
-                loc="upper center",
-                bbox_to_anchor=(0.5, 1.05),
-                ncol=len(labels),
-                fancybox=True,
-            )
-            if len(fig.axes) > 1:
-                axes[ind].set_title(f"visual stim {ind}", fontsize=8)
-                legend = axes[ind].get_legend()
-                if ind > 0 and legend is not None:
-                    legend.remove()
-        fig.set_size_inches(10, 5 * len(fig.axes))
-        fig.subplots_adjust(hspace=0.3)
-        return fig
+        """Deprecated: use `npc_stim.plot_stim_offsets(sync, npc_stim.get_display_times(...))`."""
+        _warn_moved("SyncDataset.plot_stim_offsets", "plot_stim_offsets")
+        return _npc_stim().plot_stim_offsets(self, self._deprecated_display_time_blocks)
 
     def plot_diode_measured_sync_square_flips(
         self,
     ) -> matplotlib.figure.Figure:
-        """Plot the diode-measured sync-square changes that should occur every 1 s while stim is running."""
-        import matplotlib.pyplot as plt
-
-        stim_ons, stim_offs = self.stim_onsets, self.stim_offsets
-
-        # we want the diode flips that occur after the stim-running TTL goes high
-        # and after the vsyncs start
-        all_diode_flips = np.concatenate(
-            [
-                self.get_rising_edges("stim_photodiode", units="seconds"),
-                self.get_falling_edges("stim_photodiode", units="seconds"),
-            ]
+        """Deprecated: use `npc_stim.plot_diode_measured_sync_square_flips`."""
+        _warn_moved(
+            "SyncDataset.plot_diode_measured_sync_square_flips",
+            "plot_diode_measured_sync_square_flips",
         )
-        all_vsyncs = self.get_falling_edges("vsync_stim", units="seconds")
-
-        frequency = self.expected_diode_flip_rate
-        expected_period = 1 / frequency
-
-        # get the intervals in parts (one for each stimulus)
-        diode_flips_per_stim = self.divide_into_stim_running_blocks(all_diode_flips)
-
-        num_diode_flips_per_stim = np.array([len(_) for _ in diode_flips_per_stim])
-        # add ` width_ratios=num_diode_flips/min(num_diode_flips)``
-        fig, _ = plt.subplots(
-            1,
-            len(diode_flips_per_stim),
-            sharey=True,
-            gridspec_kw={
-                "width_ratios": num_diode_flips_per_stim / min(num_diode_flips_per_stim)
-            },
-        )
-        fig.suptitle(
-            f"diode-measured sync-square flip intervals, {expected_period = } s"
-        )
-        y_deviations_from_expected_period: list[float] = []
-        for idx, (ax, d) in enumerate(zip(fig.axes, diode_flips_per_stim)):
-            # add horizontal line at expected period
-            ax.axhline(expected_period, linewidth=0.5, c="k", linestyle="--", alpha=0.3)
-            plt.sca(ax)
-            intervals = np.diff(d)
-            times = np.diff(d) / 2 + d[:-1]  # plot at mid-point of interval
-            markerline, stemline, baseline = plt.stem(
-                times, intervals, bottom=expected_period
-            )
-            plt.setp(stemline, linewidth=0.5, alpha=0.3)
-            plt.setp(markerline, markersize=0.5, alpha=0.8)
-            plt.setp(baseline, visible=False)
-
-            y_deviations_from_expected_period.append(max(intervals - expected_period))
-            y_deviations_from_expected_period.append(max(expected_period - intervals))
-            if len(fig.axes) > 1:
-                ax.set_title(f"stim {idx}", fontsize=8)
-            ax.set_xlabel("time (s)")
-            if idx == 0:
-                ax.set_ylabel("flip interval (s)")
-            ax.set_xlim(min(d) - 20, max(d) + 20)
-
-        for ax in fig.axes:
-            # after all ylims are established
-            ax.set_ylim(
-                bottom=max(
-                    0,
-                    expected_period - np.max(np.abs(y_deviations_from_expected_period)),
-                ),
-            )
-            ticks_with_period = sorted(set(ax.get_yticks()) | {expected_period})
-            ax.set_yticks(ticks_with_period)
-            if idx == 0:
-                ax.set_yticklabels([f"{_:.3f}" for _ in ticks_with_period])
-        fig.set_layout_engine("tight")
-
-        return fig
+        return _npc_stim().plot_diode_measured_sync_square_flips(self)
 
     def close(self) -> None:
         """
@@ -2123,652 +1666,55 @@ def reshape_into_blocks(
     return tuple(blocks)
 
 
-def adjust_diode_flip_intervals(
-    diode_flips: npt.NDArray[np.floating],
-) -> npt.NDArray[np.floating]:
-    """
-    diode flip intervals have a bimodal distribution due to asymmetry of
-    photodiode thresholding: adjust every other interval to get a closer
-    estimate of actual transition time for each diode flip
-    """
-    diode_flips = np.array(diode_flips)  # make a copy
-    original_intervals = np.diff(diode_flips)
-    outliers = np.logical_or(
-        np.percentile(original_intervals, 5) > original_intervals,
-        original_intervals > np.percentile(original_intervals, 95),
+# deprecated: frame display-time estimation moved to npc_stim (npc_stim.display_times) ---- #
+
+_MOVED_TO_NPC_STIM = (
+    "MONITOR_CENTER_REFRESH_TIME",
+    "AVERAGE_VSYNC_TO_DIODE_FLIP_TIME",
+    "CONSTANT_MONITOR_LAG",
+    "MIN_VSYNC_DIODE_FLIP_SEPARATION_SEC",
+    "FRAME_RATE",
+    "FRAME_INTERVAL",
+    "SUSPICIOUS_INTERVAL_THRESHOLD",
+    "DEFINITE_SHORT_INTERVAL_THRESHOLD",
+    "get_plot_dir",
+    "adjust_diode_flip_intervals",
+    "add_missing_diode_flips_for_truncated_sync",
+    "add_missing_diode_flip_at_stim_onset",
+    "discard_erroneous_diode_flips_at_stim_offset",
+    "get_frame_display_times",
+    "is_part_of_normal_pair",
+    "anomalous_interval_indices",
+    "asym_round",
+)
+
+
+def _npc_stim() -> Any:
+    """Lazy import: npc_stim depends on npc_sync, not the other way round."""
+    try:
+        import npc_stim
+    except ImportError as exc:
+        raise ImportError(
+            "Frame display-time estimation has moved to npc_stim: `pip install npc_stim`"
+        ) from exc
+    return npc_stim
+
+
+def _warn_moved(old: str, new: str) -> None:
+    warnings.warn(
+        f"npc_sync {old} is deprecated and will be removed: use npc_stim.{new}",
+        DeprecationWarning,
+        stacklevel=3,
     )
-    intervals = original_intervals[~outliers]
 
-    # the two distributions are symmetric about the mean
-    deviation = np.mean(np.abs(intervals - np.mean(intervals)))
-    if np.mean(original_intervals[0::2]) > np.mean(original_intervals[1::2]):
-        sign = 1
-    else:
-        sign = -1
 
-    for idx in range(1, len(diode_flips) - 1, 2):
-        # alternate on every short/long interval and expand/contract
-        # interval
-        diode_flips[idx] -= sign * 0.5 * deviation
-        diode_flips[idx + 1] += sign * 0.5 * deviation
-    return diode_flips
-
-
-def add_missing_diode_flips_for_truncated_sync(
-    diode_flips: npt.NDArray,
-    vsyncs: npt.NDArray,
-) -> npt.NDArray[np.float64]:
-    approx_interval = np.mean(diode_flips - vsyncs[: len(diode_flips)])
-    idx = np.searchsorted(vsyncs, diode_flips[-1], side="left")
-    while diode_flips[-1] < vsyncs[-1] + approx_interval:
-        logger.info(
-            "Creating extra diode flip at end of stim block to account for truncated sync recording"
-        )
-        diode_flips = np.array([*diode_flips, vsyncs[idx - 1] + approx_interval])
-        idx += 1
-    return diode_flips
-
-
-def add_missing_diode_flip_at_stim_onset(
-    diode_flips: npt.NDArray,
-    vsyncs: npt.NDArray,
-) -> npt.NDArray[np.float64]:
-    """
-    Transition from white screen to white sync-square on first frame results
-    in a missing diode flip (same for black-to-black).
-    Create a flip after the first vsync with an interval
-    based on the statistics of other intervals in the
-    recording.
-    Shouldn't have any side-effects, and the first frame likely contains nothing important.
-    """
-    logger.info(
-        "Creating extra diode flip at start of stim block to account for white-to-white or black-to-black transition"
-    )
-    common_len = min([len(vsyncs) - 1, len(diode_flips)])
-    avg_vsync_to_flip_interval = np.median(
-        adjust_diode_flip_intervals(diode_flips[:common_len])
-        - vsyncs[1 : common_len + 1]
-    )
-    # TODO could be more accurate by adding short/long interval as appropriate
-    # - diode_flips are pre-adjustment, but we're currently adding the expected
-    #   post-adjustment interval
-    t = vsyncs[0] + avg_vsync_to_flip_interval
-    assert t < diode_flips[0]
-    return np.array([t, *diode_flips])
-
-
-def discard_erroneous_diode_flips_at_stim_offset(
-    diode_flips: npt.NDArray, vsyncs: npt.NDArray
-) -> npt.NDArray[np.float64]:
-    """
-    - after a stimulus the screen usually turns grey, causing
-    the diode to flip at least one more time after all stim
-    vsyncs are finished.
-    - the grey screen itself may be on the threshold of diode activation, causing
-    multiple additional flips
-
-    remove the last flip if doesn't look time-locked with a
-    vsync (ie. vsync-to-flip interval is an outlier)
-    """
-    while len(diode_flips[diode_flips > vsyncs[-1]]) > 1 and len(diode_flips) > len(
-        vsyncs
-    ):
-        diode_flips = diode_flips[:-1]
-    return diode_flips
-
-
-def get_frame_display_times(
-    vsync_times: npt.NDArray,
-    on_flip_times: npt.NDArray,
-    off_flip_times: npt.NDArray,
-    vsyncs_per_flip: int,
-    is_first_frame_off: bool | None = None,
-    adjust_dropped_frames: bool = True,
-    check_lengths: bool = True,
-    check_vsyncs: bool = True,
-    stim_id: str | None = None,
-) -> npt.NDArray[np.float64]:
-    # first, shift vsyncs forwards in time by the monitor latency, so we can more easily match up
-    # diode flips and vsyncs
-    vsync_times = vsync_times + AVERAGE_VSYNC_TO_DIODE_FLIP_TIME
-    if vsyncs_per_flip == 1:
-        # default to using ON flip times (half length of vsyncs) upsampled 2x to put OFF frame halfway between ON
-        # frames
-        # - if ON flip interval is longer than two screen refreshes (ie a "dropped" frame), check
-        #   whether the two corresponding vsync intervals show one longer and one shorter, then use this
-        #   to determine the position of the OFF frame
-        # - if the first frame is OFF, we can't adjust the first vsync time: we have to create it
-
-        # some checks to make sure arrays are the expected lengths:
-        if is_first_frame_off is None and off_flip_times is None:
-            raise ValueError(
-                "Either is_first_frame_off or off_flip_times must be provided to get_frame_display_times"
-            )
-        if is_first_frame_off is None:
-            is_first_frame_off = off_flip_times[0] < on_flip_times[0]
-        if off_flip_times is not None:
-            is_last_frame_on = on_flip_times[-1] > off_flip_times[-1]
-        elif len(vsync_times) % 2:
-            is_last_frame_on = not is_first_frame_off
-        else:
-            is_last_frame_on = is_first_frame_off
-        if check_lengths:
-            # lengths aren't actually critical for the function to work
-            assert (
-                len(vsync_times)
-                == len(on_flip_times) * 2 + is_first_frame_off - is_last_frame_on
-            )
-        if off_flip_times is not None:
-            assert (
-                len(off_flip_times)
-                == len(on_flip_times) + is_first_frame_off - is_last_frame_on
-            )
-            assert (off_flip_times[0] < on_flip_times[0]) == is_first_frame_off
-            assert (on_flip_times[-1] > off_flip_times[-1]) == is_last_frame_on
-        if check_lengths:
-            display_times = np.full(len(vsync_times), np.nan)
-        else:
-            display_times = np.full(
-                len(on_flip_times) * 2 + is_first_frame_off - is_last_frame_on, np.nan
-            )
-
-        on_intervals = np.diff(on_flip_times)
-
-        # Create OFF frame times as midpoints between ON frames
-        fake_off_flip_times = on_flip_times[:-1] + 0.5 * on_intervals
-        if not is_last_frame_on:
-            # the last OFF flip happens after the last ON flip - currently missing a time value
-            fake_off_flip_times = np.append(
-                fake_off_flip_times, fake_off_flip_times[-1] + on_intervals[-1]
-            )
-
-        if is_first_frame_off:
-            fake_off_flip_times = np.insert(
-                fake_off_flip_times, 0, fake_off_flip_times[0] - on_intervals[0]
-            )
-
-        if adjust_dropped_frames:
-            if off_flip_times is None:
-                raise ValueError(
-                    "off_flip_times must be provided if adjust_dropped_frames is True"
-                )
-
-            median_refresh_interval = np.median(on_intervals) / 2
-
-            for idx in np.where(on_intervals > 2.5 * median_refresh_interval)[0]:
-
-                # get the off frame idx we're going to adjust:
-                off_frame_idx = idx + is_first_frame_off
-
-                # check for correctness so we can raise in debugger and examine values from previous loop:
-                if is_first_frame_off:
-                    assert all(
-                        (
-                            on_flip_times[:off_frame_idx]
-                            - fake_off_flip_times[:off_frame_idx]
-                        )
-                        > 0
-                    ), "Adjusting OFF flips in previous loop has disturbed order of ON-OFF sequences"
-                else:
-                    assert all(
-                        (
-                            fake_off_flip_times[:off_frame_idx]
-                            - on_flip_times[:off_frame_idx]
-                        )
-                        > 0
-                    ), "Adjusting OFF flips in previous loop has disturbed order of ON-OFF sequences"
-
-                n_refresh_in_interval: int = round(
-                    on_intervals[idx] / median_refresh_interval
-                )
-                assert (
-                    n_refresh_in_interval >= 3
-                ), f"should only be considering long intervals here (regular intervals are 2): {n_refresh_in_interval=}"
-
-                #!
-                # TODO check that we're considering frames that are dropped for more than one refresh
-                # if there's more than one and we don't do it correctly we'll create a spurious long
-                # interval following the real dropped interval
-                #!
-
-                ## try just using position of OFF flip - ignore vsyncs
-                frames_to_off = (
-                    off_flip_times[off_frame_idx] - on_flip_times[idx]
-                ) / median_refresh_interval
-                n_frames_to_off = asym_round(frames_to_off, 0.9, allow_zero=False)
-                assert n_frames_to_off >= 1, "Trying to place OFF at ON frame"
-                assert (
-                    n_frames_to_off < n_refresh_in_interval
-                ), "Trying to place OFF beyond ON-ON interval"
-                fake_off_flip_times[off_frame_idx] = on_flip_times[
-                    idx
-                ] + n_frames_to_off * (on_intervals[idx] / n_refresh_in_interval)
-
-        # Fill frame times
-        display_times[0::2] = (
-            fake_off_flip_times if is_first_frame_off else on_flip_times
-        )
-        display_times[1::2] = (
-            on_flip_times if is_first_frame_off else fake_off_flip_times
-        )
-
-        common_len = min(len(vsync_times), len(display_times))
-        if get_plot_dir():
-            import matplotlib.pyplot as plt
-
-            stim_dir = get_plot_dir() / f'{stim_id or "stim"}'
-            stim_dir.mkdir(parents=True, exist_ok=True)
-
-            plt.figure()
-            plt.plot(display_times[:common_len] - vsync_times[:common_len])
-            plt.title(f"display times minus vsync times\n{stim_id=}")
-            plt.xlabel("frame idx")
-            plt.ylabel("display time - vsync time (s)")
-            plt.savefig(stim_dir / "display_times_minus_vsyncs.png")
-            plt.close()
-
-            plt.figure()
-            plt.hist(np.diff(vsync_times), label="vsyncs", bins=100, log=True)
-            plt.hist(np.diff(display_times), label="display_times", bins=100, log=True)
-            plt.legend()
-            plt.xlim(0.0, median_refresh_interval * 3.5)
-            plt.xlabel("interval (s)")
-            plt.ylabel("count")
-            plt.title(f"vsyncs and display times intervals\n{stim_id=}")
-            plt.savefig(stim_dir / "vsync_display_time_hist.png")
-            plt.close()
-
-        long_len = 2  # frames
-        if (
-            adjust_dropped_frames
-            and check_vsyncs
-            and "spontaneous" not in (stim_id or "").lower()
-        ):  # quiescent frame timings don't matter
-            long_thr = long_len - 0.9
-            long_display_time_idx = np.where(
-                np.diff(display_times) > long_thr * median_refresh_interval
-            )[0]
-            # vsyncs should be long at these same idx
-            # - vsyncs intervals aren't discretized, so it's difficult to find a threshold for a dropped frame
-            # - just check the vsyncs that correspond to lon display times (which are discretized)
-            all_vsync_diffs = np.diff(vsync_times)
-            # all_vsync_diffs =  script_frame_intervals #! <---- if unsure about vsyncs can check against script intervals - so far this always results in the same offsets (eg long intervals are synced between script and vsyncs)
-            long_vsync_misalignment = []
-            corresponding_long_vsyncs = []
-            max_shift = 6
-            for idx in long_display_time_idx:
-                shifts = list(range(0, -max_shift, -1)) + list(range(1, max_shift))
-                shifts = [
-                    shift
-                    for shift in shifts
-                    if (idx + shift > 0) and (idx + shift < len(all_vsync_diffs))
-                ]
-                shifted_vsync_diffs = [all_vsync_diffs[idx + shift] for shift in shifts]
-                shift_idx = np.argmax(shifted_vsync_diffs)
-                if (
-                    v := shifted_vsync_diffs[shift_idx]
-                ) < long_thr * median_refresh_interval:
-                    raise IndexError(
-                        f"{stim_id}: Could not find long vsync for {idx=} with {max_shift=} either side of long frame display time: signals have become too misaligned"
-                    )
-                long_vsync_misalignment.append(
-                    shifts[shift_idx] * -1
-                )  # inv sign to express vsync idx relative to flip idx (ie -1 means long vsync idx is 1 less than long diode flip idx)
-                corresponding_long_vsyncs.append(v)
-            long_vsync_misalignment = np.array(long_vsync_misalignment)
-            if get_plot_dir():
-                plt.figure()
-                plt.step(long_display_time_idx, long_vsync_misalignment)
-                plt.xlabel("frame idx")
-                plt.ylabel(
-                    "misalignment with vsyncs\n(+ve means index of long flips is shifted to right relative to vsyncs)"
-                )
-                plt.title(
-                    f"long frame display times misalignment with vsyncs\n{stim_id=}"
-                )
-                plt.savefig(stim_dir / "long_frame_misalignment_with_vsyncs.png")
-                plt.close()
-
-            smoothed_long_vsync_misalignment = scipy.signal.medfilt(
-                long_vsync_misalignment, kernel_size=3
-            )
-            # tolerate some misalignment:
-            # - we often get a few frames that are misaligned individually, but not sequentially
-            # - can't currently explain them, but if they don't cause a systematic shift then we can't correct them
-            min_long_interval_num = 3
-            if len(long_vsync_misalignment) < min_long_interval_num:
-                # check vsyncs or stim file also have few long intervals
-                assert (
-                    x := len(
-                        all_vsync_diffs[
-                            all_vsync_diffs > long_thr * median_refresh_interval
-                        ]
-                    )
-                ) < min_long_interval_num * 2, f"{stim_id}: found fewer than {min_long_interval_num} long intervals in photodiode signal, but {x} long intervals in vsync signal"
-                pass
-            elif len(
-                smoothed_long_vsync_misalignment[smoothed_long_vsync_misalignment == 1]
-            ) > 0.90 * len(smoothed_long_vsync_misalignment):
-                logger.warning(
-                    f"All {len(smoothed_long_vsync_misalignment)} long frame display times are misaligned with vsyncs by +1 frame: we have an extra diode flip at the start of the stim block to remove"
-                )
-                #! remember we shifted vsyncs at the top of the function
-                assert (
-                    display_times[0] < vsync_times[0]
-                ), f"Expected first display time to have lower than usual latency after first vsync: got {x} s"
-                display_times = display_times[1:]  # remove the first frame
-            elif len(
-                smoothed_long_vsync_misalignment[smoothed_long_vsync_misalignment == -1]
-            ) > 0.90 * len(smoothed_long_vsync_misalignment):
-                # - first sync square used to be white, which would usually be detected when transitioning from the "initializing" grey screen, so we'd be missing the diode flip
-                # corresponding to the first vsync.
-                # - this was changed to always be black first on Aug 25 2023: https://github.com/samgale/DynamicRoutingTask/commit/cb6af876f4e42ddef820a8aea0f955faa8dfcb68
-                # - it's still possible to miss the first sync square frame when black if the phantom flickering during the initializing grey screen caused a black frame to precede the first frame
-                logger.warning(
-                    f"All {len(smoothed_long_vsync_misalignment)} long frame display times are misaligned with vsyncs by -1 frame: likely missed a diode flip at the start of the stim block"
-                )
-                #! remember we shifted vsyncs at the top of the function
-                assert (
-                    x := (display_times[0] - vsync_times[0])
-                ) > 0.5 * FRAME_INTERVAL, f"Expected first display time to have higher than usual latency after first vsync: got {MIN_VSYNC_DIODE_FLIP_SEPARATION_SEC + x} s"
-                display_times = np.insert(
-                    display_times, 0, display_times[0] - median_refresh_interval
-                )  # add the first frame
-
-            elif len(
-                smoothed_long_vsync_misalignment[smoothed_long_vsync_misalignment == 0]
-            ) < 0.75 * len(long_vsync_misalignment):
-                raise AssertionError(
-                    f"{stim_id}: Too many frames are misaligned with vsyncs - check plots."
-                )
-                # get longest run of non-zero elements (misaligned idx):
-                misaligned_idx = np.where(long_vsync_misalignment != 0)[0]
-                first_mismatch_idx = [
-                    i for i, v in enumerate(long_vsync_misalignment) if v != 0
-                ][0]
-                first_long_mismatch = long_display_time_idx[first_mismatch_idx]
-                last_idx_before_mismatch = (
-                    None
-                    if first_mismatch_idx == 0
-                    else long_display_time_idx[first_mismatch_idx - 1]
-                )
-
-        # common_len = min(len(vsync_times), len(display_times))
-        # assert np.all(display_times[:common_len] - vsync_times[:common_len] > 0)
-        ## ^ at the moment this may be violated (very infrequently, and only on a couple of frames in a block) so it's disabled
-    else:
-        # photodiode signal changes every N screen refreshes (here N = 3)
-        # - when frames are "dropped", N is extended by some number of frames (typically 1 but can be
-        #   more). We have reliable ON times and must work out when the dropped frames ocurred
-        #    _____________           _____________              _____________
-        #    |   :   :   |   :   :   |   :   :   |   :      :   |   :   :   |
-        # ___|   :   :   |___:___:___|   :   :   |___:______:___|   :   :   |__
-        #                                                ^ 1 "dropped" frame
-
-        # the OFF edge times are unreliable, so first use ON edges only, and discretize OFF edges to
-        # be some multiple of screen refreshes from preceding ON edge:
-        if on_flip_times[0] > off_flip_times[0]:
-            raise NotImplementedError(
-                f"{stim_id} | first diode edge in block is falling - this should not be possible with default TaskControl settings."
-                "Either the min vsync-diode flip interval needs shortening or we have spontaneous flicker. Needs handling."
-            )
-
-        n_on_to_off_refreshes = np.round(
-            (off_flip_times - on_flip_times[: len(off_flip_times)]) / FRAME_INTERVAL
-        )
-        assert len(n_on_to_off_refreshes) == len(off_flip_times) <= len(on_flip_times)
-        assert min(n_on_to_off_refreshes[:-1]) >= vsyncs_per_flip
-        adjusted_off_flip_times = on_flip_times[: len(off_flip_times)] + (
-            n_on_to_off_refreshes * FRAME_INTERVAL
-        )
-        assert np.all(adjusted_off_flip_times > on_flip_times)
-        flips = np.sort(np.concatenate([on_flip_times, adjusted_off_flip_times]))
-
-        # - flips wont be exactly N-frames long, but must be longer than (N-1 + some variability)
-        #   frames
-        # - only check up to last flip, incase it's a rising edge caused by transition to desktop
-        assert np.all(
-            np.diff(flips[:-1]) > ((vsyncs_per_flip - 0.75) * FRAME_INTERVAL)
-        ), f"{stim_id} has diode flip intervals that are too short: {min(np.diff(flips)) * FRAME_RATE = :.3f}, {np.mean(np.diff(flips)) * FRAME_RATE = :.3f} (expected {vsyncs_per_flip})"
-
-        # now work out actual frame display times between each rising-falling edge pair
-        display_times = []
-        regular_intervals = np.arange(
-            0, vsyncs_per_flip * FRAME_INTERVAL, FRAME_INTERVAL
-        )
-        n_refreshes_per_interval = np.round(np.diff(flips) / FRAME_INTERVAL)
-        assert len(n_refreshes_per_interval) == len(flips[:-1])
-        for idx, (flip, n_refreshes) in enumerate(
-            zip(flips[:-1], n_refreshes_per_interval)
-        ):
-            # last flip is skipped, which is what we would want in the ideal case that
-            # n_frames % (2 * vsyncs_per_flip) < vsyncs_per_flip, AND the inter-stim screen is black
-            # e.g.
-            #    _____________ <-- last OFF is not a stim frame but transition to inter-stim black
-            #    |   :   :   |
-            # ___|   :   :   |___________________
-            # doesn't hold if the last sync square is black: deal with this after the loop
-            if display_times:
-                assert (
-                    flip > display_times[-1]
-                ), f"{stim_id} {idx=} | diode flips are not strictly increasing"
-
-            n_dropped = n_refreshes - vsyncs_per_flip
-            if n_dropped == 0:
-                display_times.extend(flip + regular_intervals)
-                continue
-            if n_dropped < 0 and idx == (len(n_refreshes_per_interval) - 1):
-                # short last interval as stim stops before N presentations of sync square
-                display_times.extend(flip + regular_intervals[: int(n_dropped)])
-                continue
-
-            # use corresponding vsync intervals to determine which frame(s) were dropped
-            vsync_intervals = np.diff(
-                vsync_times[idx * vsyncs_per_flip : (idx + 1) * vsyncs_per_flip + 1]
-            )
-            if n_dropped == 1:
-                long_idx = [np.argmax(vsync_intervals)]
-                long_refreshes = [1]
-            else:
-                assert n_dropped > 0
-                # figure out how many frames were dropped,
-                # and how many screen refreshes dropped for each
-                long_thr = 1.1 * FRAME_INTERVAL
-                long_idx = np.where(vsync_intervals > long_thr)[0].tolist()
-                long_refreshes = np.round(vsync_intervals[long_idx] / FRAME_INTERVAL)
-                # long_refreshes is number of screen refreshes for each dropped frame
-                if sum(long_refreshes) != n_dropped:
-                    if len(long_refreshes) == 1:
-                        assert long_refreshes[0] != n_dropped
-                        # we found a long vsync, but it rounds up to more frames than expected
-                        long_refreshes[0] = n_dropped
-                    elif len(long_refreshes) > 1:  #
-                        # we found multiple long vsyncs, but they don't sum to the expected number
-                        # of dropped frames - use the relative lengths to assign dropped frames
-                        prop_refreshes = long_refreshes / sum(long_refreshes)
-                        long_refreshes = np.ceil(prop_refreshes * n_dropped).astype(int)
-                        while sum(long_refreshes) > n_dropped:
-                            # remove one from the largest
-                            long_refreshes[np.argmax(long_refreshes)] -= 1
-                        assert np.all(long_refreshes > 0)
-                    else:
-                        msg = f"{stim_id} | Faulty locating of dropped frames - something doesn't add up: {vsync_intervals=}, {long_refreshes=} ({long_thr=})"
-                        if (
-                            vsyncs_per_flip > 30
-                        ):  # we're potentially mis-aligning many frames here
-                            raise AssertionError(msg)
-                        logger.warning(msg)
-                        # put one long frame in the middle of the long flip interval, which is the best we can
-                        # do on average
-                        long_idx = [vsyncs_per_flip // 2]
-                        long_refreshes = [n_dropped]
-
-            evenly_spaced_times = np.linspace(
-                flip, flips[idx + 1], int(n_refreshes) + 1, endpoint=True
-            )[:-1]
-            assert np.all(
-                np.isclose(np.diff(evenly_spaced_times) / FRAME_INTERVAL, 1, rtol=0.05)
-            )
-            new_times = []
-            i = -1
-            for n in range(vsyncs_per_flip):
-                i += 1
-                if i - 1 in long_idx:
-                    i += int(long_refreshes[long_idx.index(i - 1)])
-                t = evenly_spaced_times[i]
-                new_times.append(t)
-                # if the last interval is a long one nothing happens: inserting the next flip will
-                # produce the long interval
-            assert len(new_times) == vsyncs_per_flip
-            assert flips[idx + 1] not in new_times, "prematurely added next flip"
-            display_times.extend(new_times)
-
-        # at this point, we could have up to vsync_intervals -1 frames not enclosed by a diode flip at
-        # the end of the experiment, for example:
-        #    _____________           _____________________ <-- display stays bright after last frame
-        #    |   :   :   |   :   :   |   :   :
-        # ___|   :   :   |___:___:___|   :   :
-        #    _____________
-        #    |   :   :   |   :   :
-        # ___|   :   :   |___:___:______________
-        n_missing = len(vsync_times) - len(display_times)
-
-        if n_missing > 0:
-            assert (
-                flips[-1] not in display_times
-            ), "already used last flip in display times"
-            if n_missing > vsyncs_per_flip:
-                logger.warning(
-                    f"More missing frames ({n_missing}) than vsyncs per flip ({vsyncs_per_flip}) - indicates that this is something different to the last flip being missed"
-                )
-            display_times.extend(
-                flips[-1] + np.arange(0, n_missing * FRAME_INTERVAL, FRAME_INTERVAL)
-            )
-
-    assert not np.any(np.isnan(display_times))
-    assert np.all(np.diff(display_times) > 0)
-
-    return np.array(display_times)
-
-
-def is_part_of_normal_pair(
-    prev_interval_dur, suspicious_interval_dur, next_interval_dur
-) -> bool:
-    """
-    Normal pairs sum to 2 frames (without any dropped frames), and typically alternate long-short intervals:
-    >>> is_part_of_normal_pair(1.3 / 59.95, 0.7 / 59.95, 1.3 / 59.95)
-    True
-
-    Should be robust to short intervals on either side of the suspicious interval:
-    >>> is_part_of_normal_pair(0.05 / 59.95, 0.7 / 59.95, 1.3 / 59.95)
-    True
-    >>> is_part_of_normal_pair(1.3 / 59.95, 0.7 / 59.95, 0.05 / 59.95)
-    True
-
-    Should allow for an integer number of frames to accommodate dropped frames:
-    >>> is_part_of_normal_pair(2.3 / 59.95, 0.7 / 59.95, 2.3 / 59.95)
-    True
-    >>> is_part_of_normal_pair(1.3 / 59.95, 1.7 / 59.95, 0.1 / 59.95)
-    True
-
-    Must detect anomalous intervals that don't sum to an integer number of frames:
-    >>> is_part_of_normal_pair(1.3 / 59.95, 0.01 / 59.95, 0.7 / 59.95)
-    False
-
-    Must detect anomalous intervals that don't sum to an integer number of frames:
-    >>> is_part_of_normal_pair(2.3 / 59.95, 0.01 / 59.95, 0.7 / 59.95)
-    False
-
-    Must be robust to short intervals on either side of the suspicious interval:
-    >>> is_part_of_normal_pair(1.3 / 59.95, 0.01 / 59.95, 0.01 / 59.95)
-    False
-    >>> is_part_of_normal_pair(0.01 / 59.95, 0.01 / 59.95, 1.3 / 59.95)
-    False
-    """
-    if (suspicious_interval_dur * FRAME_RATE) < DEFINITE_SHORT_INTERVAL_THRESHOLD:
-        # if the suspicious interval is extremely short, it can't be real
-        return False
-
-    result = False
-    for other in (prev_interval_dur, next_interval_dur):
-        if other is None:
-            # if there's no next or previous interval, we can't check the pair
-            continue
-        interval_pair_sum = suspicious_interval_dur + other
-
-        # if the sum of the two intervals is less than 2 frames it's anomalous
-        if interval_pair_sum < (2 * FRAME_INTERVAL) - SUSPICIOUS_INTERVAL_THRESHOLD:
-            continue
-
-        # if the sum of the two intervals is not close to an integer number of frames, it's  anomalous
-        if round(interval_pair_sum * FRAME_RATE, 1) % 1 != 0:
-            continue
-
-        # after checking previous, we can assume the pair is normal
-        result = True
-        break
-
-    return result
-
-
-def anomalous_interval_indices(flips, num_vsyncs_per_diode_flip: float):
-    intervals = np.diff(flips)
-    short_intervals = []
-    for idx in sorted(
-        np.where(
-            intervals
-            < ((num_vsyncs_per_diode_flip - 1) * FRAME_INTERVAL)
-            + SUSPICIOUS_INTERVAL_THRESHOLD
-        )[0]
-    ):
-        if idx in short_intervals:
-            continue
-        if num_vsyncs_per_diode_flip > 1 and idx == len(intervals) - 1:
-            continue  # the last interval can be short as it returns to dark screen before N stim frames
-
-        # a short blip on the line must occur as an ON-OFF pair, due to the way sync detects rising/falling edges (e.g. cannot have to rising)
-        # ie both indices must be present, so we can delete the first one
-
-        if num_vsyncs_per_diode_flip == 1 and is_part_of_normal_pair(
-            prev_interval_dur=intervals[idx - 1] if idx - 1 >= 0 else None,
-            suspicious_interval_dur=intervals[idx],
-            next_interval_dur=intervals[idx + 1] if idx + 1 < len(intervals) else None,
-        ):
-            # if the short interval actually sums to an integer number of intervals with one of its neighbours, it's not anomalous
-            continue
-        short_intervals.append(idx)
-    short_intervals = np.sort(short_intervals)
-    return short_intervals
-
-
-def asym_round(
-    x: npt.ArrayLike, threshold: float = 0.5, allow_zero: bool = False
-) -> npt.NDArray[np.int_]:
-    """
-    For figuring out how many frames *should* have been displayed given a noisy interval.
-
-    Like a regular round, but rounding up from >=`threshold` instead of the usual 0.5.
-    Anything that would become zero is pushed to 1 if `allow_zero` is False (default, since 0 frames
-    isn't possible).
-
-    >>> asym_round([0.1, 1.19, 1.5, 2.21], threshold=0.2, allow_zero=False)
-    array([1, 1, 2, 3])
-
-    """
-    x = np.asarray(x)
-    if allow_zero:
-        lower_values = np.floor(x)
-    else:
-        # take greater of floor(x) and 1, to avoid rounding to zero
-        lower_values = np.maximum(np.floor(x), np.ones_like(x))
-    # avoid using x - np.floor(x) which will incur floating point errors:
-    return np.where(x < np.floor(x) + threshold, lower_values, np.ceil(x)).astype(int)
-
+def __getattr__(name: str) -> Any:
+    if name in _MOVED_TO_NPC_STIM:
+        _warn_moved(name, name)
+        return getattr(_npc_stim().display_times, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 if __name__ == "__main__":
-    SyncDataset(
-        "//allen/programs/mindscope/workgroups/dynamicrouting/PilotEphys/Task 2 pilot/DRpilot_796848_20250716/20250716T124108.h5"
-    ).frame_display_time_blocks
     from npc_sync import testmod
 
     testmod()

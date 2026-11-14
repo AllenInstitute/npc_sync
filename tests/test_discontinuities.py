@@ -73,15 +73,6 @@ def test_too_few_or_no_barcodes() -> None:
     assert find(ONSETS[:2]) == ()
 
 
-def test_frame_display_time_blocks_fails_fast_on_discontinuity() -> None:
-    sync = object.__new__(npc_sync.SyncDataset)
-    sync.path = pathlib.Path("dropped.h5")
-    sync.invalid_intervals = ()
-    sync.timebase_discontinuities = ((2458.56, 2488.58, -1.0),)
-    with pytest.raises(AssertionError, match="2458.560-2488.580 s"):
-        _ = sync.frame_display_time_blocks
-
-
 DATA = pathlib.Path(__file__).parents[1] / "experiments" / "vsync-frame-count" / "data"
 KNOWN = {
     "DRpilot_836629_20260430": (),
