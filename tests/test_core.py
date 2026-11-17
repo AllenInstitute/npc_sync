@@ -33,7 +33,12 @@ def test_init_from_instance_and_meta_data() -> None:
 def test_moved_names_are_deprecated_aliases_of_npc_stim() -> None:
     import warnings
 
-    import npc_stim
+    import pytest
+
+    npc_stim = pytest.importorskip("npc_stim")
+    if not hasattr(npc_stim, "display_times"):
+        # bootstrapping the release: npc_stim with display_times needs this npc_sync on PyPI first
+        pytest.skip("installed npc_stim predates the move of display times")
 
     for name in ("FRAME_RATE", "CONSTANT_MONITOR_LAG", "get_frame_display_times", "asym_round"):
         with warnings.catch_warnings(record=True) as w:
