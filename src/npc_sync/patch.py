@@ -15,9 +15,10 @@ of:
 Everything here works on arrays (seconds on the sync clock) so that the reconstructions can be
 checked independently of `SyncDataset`. The builder that combines them is `build_sync_patch`.
 
-Gates are the values in the npc_sessions plan (`outputs/sync-frame-timing-upgrade-plan.md`):
-per-gap vsync residual <= 0.5 ms with the second-best frame count >= 10 ms worse and an exact
-block balance; camera residual <= 0.1 ms with |gap / period - n| <= 0.01.
+Gates (npc_sessions `outputs/sync-frame-timing-upgrade-plan.md`, re-derived from the P0
+manifest): per-gap vsync residual <= 0.2 ms with the second-best frame count >= 10 ms worse and
+an exact block balance; camera residual <= 0.1 ms with |gap / period - n| <= 0.01; predicted
+photodiode edges in the 0.5 s after a span within the pre-span error + 0.5 ms.
 """
 
 from __future__ import annotations
@@ -44,8 +45,15 @@ MISSING: int = 2
 """Edge source: no time available (only used in per-frame arrays, never for edges)."""
 SOURCE_NAMES = {MEASURED: "measured", INTERPOLATED: "interpolated", MISSING: "missing"}
 
-VSYNC_MAX_GAP_RESIDUAL_SEC = 0.5e-3
-"""Max |sync elapsed time - stim elapsed time| across one gap, for the best frame count."""
+VSYNC_MAX_GAP_RESIDUAL_SEC = 0.2e-3
+"""Max |sync elapsed time - stim elapsed time| across one gap, for the best frame count.
+
+Re-derived from the P0 manifest (npc_sessions experiments/sync-patch-manifest/summary.log,
+2,971 sync files): in files with < 20 invalid intervals and no timebase discontinuity, 159 of
+183 gaps are <= 0.1 ms (144 <= 0.05 ms), one is 0.13 ms, and the rest form a separate cluster
+at 0.2-0.45 ms (16 gaps, 7 sessions) plus failures > 0.5 ms. That cluster matches the
+unexplained ~0.4 ms-per-buffer residual of multi-run files, so the gate sits between the
+modes (was 0.5 ms, which admitted it)."""
 VSYNC_MIN_SECOND_BEST_MARGIN_SEC = 10e-3
 """The second-best frame count for a gap must be at least this much worse than the best."""
 PERIODIC_MAX_RESIDUAL_SEC = 0.1e-3
@@ -58,7 +66,14 @@ DIODE_MAX_RESIDUAL_ABOVE_BASELINE_SEC = 0.5e-3
 """Predicted diode edges after a span must match the measured ones to within the pre-span
 baseline error + this."""
 DIODE_LATENCY_WINDOW_SEC = 3.0
-"""Seconds of measured diode edges on each side of a span used to estimate the latency."""
+"""Seconds of measured diode edges before a span used to estimate the latency and the baseline
+error (and after it, for the polarity check)."""
+DIODE_CHECK_WINDOW_SEC = 0.5
+"""Seconds of measured diode edges right after a span compared with the prediction. Short, so
+the check tests the continuation of the predicted toggle sequence rather than unrelated latency
+outliers seconds later (with a 3 s window, 9/95 spans in the P0 manifest failed on edges
+0.2-3 s after the span while the first edges matched to <= 0.1 ms:
+npc_sessions experiments/sync-patch-manifest/diode_gate_check.log)."""
 
 
 class SyncFaultError(ValueError):
@@ -555,7 +570,8 @@ class DiodeSpanSolution:
     baseline_error_sec: float = np.nan
     """Max |measured - predicted| for measured edges in the window before the span."""
     after_error_sec: float = np.nan
-    """Max |measured - predicted| for measured edges in the window after the span."""
+    """Max |measured - predicted| for measured edges in the `DIODE_CHECK_WINDOW_SEC` after the
+    span."""
     n_polarity_errors_after: int = 0
     """Measured edges after the span whose polarity differs from the predicted toggle's."""
     n_inserted: int = 0
@@ -667,8 +683,16 @@ def predict_diode_edges(
     pre_err = float(np.max(np.abs(e_pre - pred[_nearest_index(e_pre, pred)])))
     e_post, pol_post = e[post], pol[post]
     j_post = _nearest_index(e_post, pred)
-    post_err = float(np.max(np.abs(e_post - pred[j_post])))
     n_bad_post = int((pred_rising[j_post] != pol_post).sum())
+    check = e_post < z + DIODE_CHECK_WINDOW_SEC
+    if not check.any():
+        return np.array([]), np.array([]), DiodeSpanSolution(
+            span,
+            "failed",
+            n_removed=n_removed,
+            reason=f"no measured diode edges within {DIODE_CHECK_WINDOW_SEC} s after the span",
+        )
+    post_err = float(np.max(np.abs(e_post[check] - pred[j_post[check]])))
     last_before, first_after = e[e < a][-1], e[e >= z][0]
     margin = 0.25 * box / 60
     new = (pred > last_before + margin) & (pred < first_after - margin)
