@@ -405,7 +405,7 @@ class SyncDataset:
 
     on_invalid: OnInvalid
     """What edge queries do on a line whose data inside `invalid_intervals` is not covered by
-    `patch`:
+    `patch` (a line the patch covers always gets the patch):
 
     - 'raise' (default): raise `SyncFaultError`
     - 'mask': drop the edges inside the intervals (treat them as unknown; see
@@ -424,9 +424,8 @@ class SyncDataset:
         if isinstance(path, self.__class__):
             self.path = path.path
             self.dfile = path.dfile
-            if on_invalid is None:  # same view as `path` unless overridden
-                patch = path.patch if patch is None else patch
-                on_invalid = path.on_invalid
+            if patch is None and on_invalid is None:  # same view as `path`
+                patch, on_invalid = path.patch, path.on_invalid
         else:
             self.path = npc_io.from_pathlike(path)
             self.dfile = self.load(path)
@@ -467,11 +466,13 @@ class SyncDataset:
         there and nothing replaces them. Empty if the file has no invalid intervals or the
         patch reconstructs every interval for this line. Raises like the edge getters if the
         line is neither patched nor masked."""
-        if not self.invalid_intervals or self.on_invalid == "ignore":
+        if not self.invalid_intervals:
             return ()
         key = self.line_key(line)
         if self.patch is not None and self.patch.covers(key):
             return self.patch.unknown_intervals(key)
+        if self.on_invalid == "ignore":
+            return ()
         if self.on_invalid == "mask":
             return self._mask_intervals
         raise SyncFaultError(self._invalid_message(key))
@@ -505,12 +506,14 @@ class SyncDataset:
             raise ValueError("Only 'samples' or 'seconds' are valid units.")
         fs = self.sample_freq
         sources = np.full(len(times_samples), MEASURED, dtype=np.int8)
-        if self.on_invalid == "ignore" or not self.invalid_intervals:
+        if not self.invalid_intervals:
             return (times_samples / fs if seconds else times_samples), sources
         key = self.line_key(line)
         t = times_samples / fs
         if self.patch is not None and self.patch.covers(key):
             t, sources = self.patch.apply(key, kind, t)
+        elif self.on_invalid == "ignore":
+            return (times_samples / fs if seconds else times_samples), sources
         elif self.on_invalid == "mask":
             keep = ~in_intervals(t, self._mask_intervals)
             t, sources = t[keep], sources[keep]

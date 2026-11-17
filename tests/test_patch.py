@@ -251,3 +251,24 @@ def test_clean_file_unchanged(tmp_path) -> None:
     assert np.max(np.abs(v - frames)) < 1 / FS
     assert (d.get_edge_sources("vsync_stim", "falling") == P.MEASURED).all()
     assert d.get_unknown_intervals("lick_sensor") == ()
+
+
+def test_patch_applies_to_a_view_of_a_raw_dataset(replayed) -> None:
+    """A patch passed for an `on_invalid='ignore'` dataset must be applied (it used to be
+    silently ignored, because the view inherited 'ignore')."""
+    raw = npc_sync.SyncDataset(replayed["path"], on_invalid="ignore")
+    patch = P.build_sync_patch(raw, [P.StimBlock(0, replayed["fi"], 3)], builder="test")
+    for s in (
+        npc_sync.SyncDataset(raw, patch=patch),
+        npc_sync.SyncDataset(raw, patch=patch, on_invalid="ignore"),
+    ):
+        v = s.get_falling_edges("vsync_stim", units="seconds")
+        assert len(v) == len(replayed["frames"])
+        assert s.get_unknown_intervals("lick_sensor")
+    assert npc_sync.SyncDataset(raw, patch=patch).on_invalid == "raise"
+    # a view without a patch of a patched dataset inherits it
+    patched = npc_sync.SyncDataset(raw, patch=patch)
+    assert npc_sync.SyncDataset(patched).patch is patch
+    # the builder sees the recorded edges even if given a patched dataset
+    again = P.build_sync_patch(patched, [P.StimBlock(0, replayed["fi"], 3)], builder="test")
+    assert again.to_dict()["lines"] == patch.to_dict()["lines"]
