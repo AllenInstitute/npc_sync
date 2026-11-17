@@ -7,6 +7,7 @@ import importlib.metadata
 import logging
 
 # import functions from submodules here:
+from npc_sync.patch import *
 from npc_sync.sync import *
 
 

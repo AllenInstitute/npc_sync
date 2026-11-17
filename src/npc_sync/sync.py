@@ -10,6 +10,7 @@ Allen Institute for Brain Science
 from __future__ import annotations
 
 import datetime
+import hashlib
 import io
 import logging
 import os
@@ -25,6 +26,14 @@ import numpy.typing as npt
 import upath
 from typing_extensions import Self, TypeAlias
 
+from npc_sync.patch import (
+    MEASURED,
+    SyncFaultError,
+    SyncPatch,
+    in_intervals,
+    line_key,
+)
+
 if TYPE_CHECKING:
     import matplotlib.axes
     import matplotlib.figure
@@ -33,6 +42,8 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 SyncPathOrDataset: TypeAlias = Union[npc_io.PathLike, h5py.File, "SyncDataset"]
+
+OnInvalid: TypeAlias = Literal["raise", "mask", "ignore"]
 
 FIRST_SOUND_ON_SYNC_DATE = datetime.date(2023, 8, 31)
 """Prior to this date, there's no sync line with "sound running" signal, on any rig: need to
@@ -389,14 +400,33 @@ class SyncDataset:
     """Deprecated: only used by the deprecated display-time members, which moved to
     npc_stim (pass stim paths to `npc_stim.get_display_times` instead)."""
 
+    patch: SyncPatch | None
+    """Replacement edges inside `invalid_intervals` (see `npc_sync.patch`)."""
+
+    on_invalid: OnInvalid
+    """What edge queries do on a line whose data inside `invalid_intervals` is not covered by
+    `patch`:
+
+    - 'raise' (default): raise `SyncFaultError`
+    - 'mask': drop the edges inside the intervals (treat them as unknown; see
+      `get_unknown_intervals`)
+    - 'ignore': return the recorded edges, copies included (the behaviour before 0.3.2; for
+      diagnostics only)
+    """
+
     def __init__(
         self,
         path: npc_io.PathLike | Self,
         stim_paths: Iterable[npc_io.PathLike] | None = None,
+        patch: SyncPatch | None = None,
+        on_invalid: OnInvalid | None = None,
     ) -> None:
         if isinstance(path, self.__class__):
             self.path = path.path
             self.dfile = path.dfile
+            if on_invalid is None:  # same view as `path` unless overridden
+                patch = path.patch if patch is None else patch
+                on_invalid = path.on_invalid
         else:
             self.path = npc_io.from_pathlike(path)
             self.dfile = self.load(path)
@@ -404,9 +434,109 @@ class SyncDataset:
             self.stim_paths = None
         else:
             self.stim_paths = tuple(npc_io.from_pathlike(p) for p in stim_paths)
+        self.on_invalid = on_invalid or "raise"
+        if self.on_invalid not in ("raise", "mask", "ignore"):
+            raise ValueError(
+                f"on_invalid must be 'raise', 'mask' or 'ignore': got {on_invalid!r}"
+            )
+        self.patch = patch
+        if patch is not None and patch.sync_content_hash != self.content_hash:
+            raise ValueError(
+                "patch was built for a different sync file (content hash "
+                f"{patch.sync_content_hash[:12]}..., this file {self.content_hash[:12]}...)"
+            )
 
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}({self.path.as_posix()})"
+
+    @npc_io.cached_property
+    def content_hash(self) -> str:
+        """sha256 of the event data and metadata: identifies the recording a `SyncPatch` was
+        built for, wherever the file is stored."""
+        h = hashlib.sha256()
+        h.update(np.ascontiguousarray(self.dfile["data"][()]).tobytes())
+        h.update(repr(sorted(self.meta_data.items(), key=lambda kv: kv[0])).encode())
+        return h.hexdigest()
+
+    def line_key(self, line: str | int) -> str:
+        """Label of a line, or 'bit<n>' if it's unlabelled (the key used in `SyncPatch`)."""
+        return line_key(self.line_labels, self._line_to_bit(line))
+
+    def get_unknown_intervals(self, line: str | int) -> tuple[tuple[float, float], ...]:
+        """Intervals (seconds) in which events on `line` are unknown: no edges are returned
+        there and nothing replaces them. Empty if the file has no invalid intervals or the
+        patch reconstructs every interval for this line. Raises like the edge getters if the
+        line is neither patched nor masked."""
+        if not self.invalid_intervals or self.on_invalid == "ignore":
+            return ()
+        key = self.line_key(line)
+        if self.patch is not None and self.patch.covers(key):
+            return self.patch.unknown_intervals(key)
+        if self.on_invalid == "mask":
+            return self._mask_intervals
+        raise SyncFaultError(self._invalid_message(key))
+
+    @property
+    def _mask_intervals(self) -> tuple[tuple[float, float], ...]:
+        """Invalid intervals, starting one sample early: the event at the sample before a copy
+        can carry the copy's state (see `npc_sync.patch.build_sync_patch`)."""
+        return tuple((a - 1 / self.sample_freq, z) for a, z in self.invalid_intervals)
+
+    def _invalid_message(self, key: str) -> str:
+        shown = ", ".join(f"{a:.3f}-{z:.3f} s" for a, z in self.invalid_intervals[:5])
+        more = ", ..." if len(self.invalid_intervals) > 5 else ""
+        return (
+            f"{self}: sync data on all lines is invalid in {len(self.invalid_intervals)} "
+            f"replayed interval(s) ({shown}{more}) and no patch covers {key!r}: supply "
+            "`patch=` (see npc_sync.patch) or use `on_invalid='mask'`"
+        )
+
+    def _apply_invalid_policy(
+        self,
+        line: str | int,
+        kind: Literal["rising", "falling"],
+        times_samples: npt.NDArray[Any],
+        units: str,
+    ) -> tuple[npt.NDArray[Any], npt.NDArray[np.int8]]:
+        """Recorded edges (samples) -> edges in `units` after the invalid-interval policy,
+        plus the per-edge source (see `npc_sync.patch.SOURCE_NAMES`)."""
+        seconds = units.lower() in ("seconds", "sec", "secs")
+        if not seconds and units.lower() != "samples":
+            raise ValueError("Only 'samples' or 'seconds' are valid units.")
+        fs = self.sample_freq
+        sources = np.full(len(times_samples), MEASURED, dtype=np.int8)
+        if self.on_invalid == "ignore" or not self.invalid_intervals:
+            return (times_samples / fs if seconds else times_samples), sources
+        key = self.line_key(line)
+        t = times_samples / fs
+        if self.patch is not None and self.patch.covers(key):
+            t, sources = self.patch.apply(key, kind, t)
+        elif self.on_invalid == "mask":
+            keep = ~in_intervals(t, self._mask_intervals)
+            t, sources = t[keep], sources[keep]
+        else:
+            raise SyncFaultError(self._invalid_message(key))
+        if seconds:
+            return t, sources
+        return np.round(t * fs).astype(np.int64), sources
+
+    def get_edge_sources(
+        self, line: str | int, kind: Literal["rising", "falling"]
+    ) -> npt.NDArray[np.int8]:
+        """Per-edge source (MEASURED=0, INTERPOLATED=1) aligned with `get_rising_edges` or
+        `get_falling_edges` for `line`."""
+        raw = self._get_recorded_edges(line, kind)
+        return self._apply_invalid_policy(line, kind, raw, "samples")[1]
+
+    def _get_recorded_edges(
+        self, line: str | int, kind: Literal["rising", "falling"]
+    ) -> npt.NDArray[Any]:
+        """Edges as recorded (samples), copies included."""
+        bit = self._line_to_bit(line)
+        changes = self.get_bit_changes(bit)
+        return self.get_all_times("samples")[
+            np.where(changes == (1 if kind == "rising" else 255))
+        ]
 
     def validate(
         self,
@@ -667,8 +797,14 @@ class SyncDataset:
             Bit for which to return events.
 
         """
-        changes = self.get_bit_changes(bit)
-        return self.get_all_times(units)[np.where(changes != 0)]
+        return np.sort(
+            np.concatenate(
+                [
+                    self.get_rising_edges(bit, units=units),
+                    self.get_falling_edges(bit, units=units),
+                ]
+            )
+        )
 
     def get_events_by_line(
         self, line: str | int, units: Literal["samples", "seconds"] = "samples"
@@ -700,6 +836,12 @@ class SyncDataset:
         if type(line) is int:
             return line
         elif type(line) is str:
+            if (
+                line not in self.line_labels
+                and line.startswith("bit")
+                and line[3:].isdigit()
+            ):
+                return int(line[3:])
             return self.line_labels.index(line)
         else:
             raise TypeError("Incorrect line type.  Try a str or int.")
@@ -728,9 +870,8 @@ class SyncDataset:
             Line for which to return edges.
 
         """
-        bit = self._line_to_bit(line)
-        changes = self.get_bit_changes(bit)
-        return self.get_all_times(units)[np.where(changes == 1)]
+        raw = self._get_recorded_edges(line, "rising")
+        return self._apply_invalid_policy(line, "rising", raw, units)[0]
 
     def get_edges(
         self,
@@ -797,9 +938,8 @@ class SyncDataset:
             Line for which to return edges.
 
         """
-        bit = self._line_to_bit(line)
-        changes = self.get_bit_changes(bit)
-        return self.get_all_times(units)[np.where(changes == 255)]
+        raw = self._get_recorded_edges(line, "falling")
+        return self._apply_invalid_policy(line, "falling", raw, units)[0]
 
     def get_nearest(
         self,
@@ -1224,7 +1364,7 @@ class SyncDataset:
         if not self.has_barcodes:
             return ()
         result = find_barcode_discontinuities(
-            self.get_rising_edges("barcode_ephys", units="seconds"),
+            self._get_recorded_edges("barcode_ephys", "rising") / self.sample_freq,
             total_seconds=self.total_seconds,
             invalid_intervals=self.invalid_intervals,
         )
@@ -1242,7 +1382,7 @@ class SyncDataset:
         discontinuities can't be detected from barcodes)."""
         return (
             "barcode_ephys" in self.line_labels
-            and self.get_rising_edges("barcode_ephys").size > 0
+            and self._get_recorded_edges("barcode_ephys", "rising").size > 0
         )
 
     @property
@@ -1268,7 +1408,11 @@ class SyncDataset:
         )
 
         vsync_times_in_blocks = list(
-            reshape_into_blocks(vsync_falling_edges, min_gap=1.0)
+            reshape_into_blocks(
+                vsync_falling_edges,
+                min_gap=1.0,
+                bridge=self.get_unknown_intervals("vsync_stim"),
+            )
         )
 
         block_lengths = np.array([len(block) for block in vsync_times_in_blocks])
@@ -1321,6 +1465,7 @@ class SyncDataset:
         return reshape_into_blocks(
             self.filter_on_stim_running(edges, end_padding=end_padding),
             min_gap=1.0,
+            bridge=self.get_unknown_intervals(line),
         )
 
     # deprecated: moved to npc_stim ------------------------------------------- #
@@ -1610,6 +1755,7 @@ class SyncDataset:
 def reshape_into_blocks(
     indices: Sequence[float] | npt.NDArray[np.floating],
     min_gap: int | float | None = None,
+    bridge: Iterable[tuple[float, float]] = (),
 ) -> tuple[npt.NDArray[np.floating], ...]:
     """
     Find the large gaps in indices and split at each gap.
@@ -1624,6 +1770,12 @@ def reshape_into_blocks(
 
     >>> reshape_into_blocks([0, 1, 2, 3])
     (array([0, 1, 2, 3]),)
+
+    Gaps that overlap a `bridge` interval (data unknown there, e.g. masked invalid
+    intervals) don't split blocks:
+
+    >>> reshape_into_blocks([0, 1, 2, 103, 104, 105], min_gap=100, bridge=[(50, 60)])
+    (array([  0,   1,   2, 103, 104, 105]),)
     """
     indices = np.array(indices)
     intervals = np.diff(indices)
@@ -1639,6 +1791,9 @@ def reshape_into_blocks(
     ):
         if interval > long_interval_threshold:
             # large interval found
+            gap_start, gap_stop = indices[interval_index], indices[interval_index + 1]
+            if any(a < gap_stop and z > gap_start for a, z in bridge):
+                continue
             gaps_between_blocks.append(interval_index + 1)
         else:
             break
