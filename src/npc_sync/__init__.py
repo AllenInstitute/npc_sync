@@ -16,6 +16,7 @@ def __getattr__(name: str):
 
     return npc_sync.sync.__getattr__(name)
 
+
 logger = logging.getLogger(__name__)
 
 __version__ = importlib.metadata.version("npc_sync")

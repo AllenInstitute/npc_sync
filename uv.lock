@@ -2151,25 +2151,8 @@ wheels = [
 ]
 
 [[package]]
-name = "npc-stim"
-version = "0.1.23"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "npc-io" },
-    { name = "npc-session" },
-    { name = "npc-sync" },
-    { name = "scipy", version = "1.13.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.10'" },
-    { name = "scipy", version = "1.15.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.10.*'" },
-    { name = "scipy", version = "1.16.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/39/9d/5a2ef1d3126ecdac0e87a6cabd67e2f5b34b8b3b5ffba48f000bccf91ba4/npc_stim-0.1.23.tar.gz", hash = "sha256:841dff61b335e53464eef04cbfcf5e3c6983ad5815a1c2ddf8f2ecf261bf3cfe", size = 13319, upload-time = "2026-09-24T21:07:52.064Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/f4/76/f3f1a0a619002f92441101d9a4edc9e1f1eca4304ea80e83cae271cb31ee/npc_stim-0.1.23-py3-none-any.whl", hash = "sha256:f6547944c28c4ee41b539856a20b043b9cec022d6dbc36bfdcc67ed095fe057b", size = 12802, upload-time = "2026-09-24T21:07:51.028Z" },
-]
-
-[[package]]
 name = "npc-sync"
-version = "0.3.0"
+version = "0.3.1"
 source = { editable = "." }
 default-groups = ["bump", "linting", "task-runner", "testing"]
 dependencies = [
@@ -2178,7 +2161,6 @@ dependencies = [
     { name = "matplotlib", version = "3.10.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.10'" },
     { name = "npc-io" },
     { name = "npc-session" },
-    { name = "npc-stim" },
     { name = "numpy", version = "2.0.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.10'" },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.10.*'" },
     { name = "numpy", version = "2.3.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
@@ -2227,7 +2209,6 @@ requires-dist = [
     { name = "matplotlib", specifier = ">=3.8.2" },
     { name = "npc-io", specifier = ">=0.1.26" },
     { name = "npc-session", specifier = ">=0.1.33" },
-    { name = "npc-stim", specifier = ">=0.1.23" },
     { name = "numpy", specifier = ">=1.26.3" },
     { name = "scipy", specifier = ">=1.13.1" },
     { name = "typing-extensions", specifier = ">=4.9.0" },

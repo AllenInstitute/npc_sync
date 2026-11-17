@@ -65,6 +65,7 @@ BARCODE_INTERVAL_TOLERANCE_SEC = 0.010
 multiple of it, if barcodes were excluded in between) that is still considered regular.
 Observed on 6 clean files: <= 0.31 ms."""
 
+
 def get_sync_data(sync_path_or_data: SyncPathOrDataset) -> SyncDataset:
     """Open a path or file-like object and return a SyncDataset object."""
     if isinstance(sync_path_or_data, SyncDataset):
@@ -1555,7 +1556,8 @@ class SyncDataset:
     @property
     def stim_offsets(self) -> npt.NDArray[np.floating]:
         """stim_running falling edges, or the last vsync of each block if there is no
-        stim_running signal (until 0.2.9 this fell back to the last frame display time)."""
+        stim_running signal (until 0.2.9 this fell back to the last frame display time).
+        """
         if any(stim_running := self.get_falling_edges("stim_running", units="seconds")):
             return stim_running
         return np.array([block[-1] for block in self.vsync_times_in_blocks])
@@ -1713,6 +1715,7 @@ def __getattr__(name: str) -> Any:
         _warn_moved(name, name)
         return getattr(_npc_stim().display_times, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 if __name__ == "__main__":
     from npc_sync import testmod
