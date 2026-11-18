@@ -1625,7 +1625,7 @@ class SyncPatch:
     lines: dict[str, list[SpanPatch]] = dataclasses.field(default_factory=dict)
     """line label -> span patches (sorted by start)."""
     created: str = dataclasses.field(
-        default_factory=lambda: datetime.datetime.now(datetime.timezone.utc).isoformat(
+        default_factory=lambda: datetime.datetime.now(datetime.UTC).isoformat(
             timespec="seconds"
         )
     )

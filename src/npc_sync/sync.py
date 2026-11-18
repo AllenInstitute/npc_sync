@@ -245,7 +245,7 @@ def find_replayed_buffers(
         logger.warning(
             "Identical sync slots found at more than one separation "
             f"(in units of {slot_samples} samples): "
-            f"{dict(zip(values.tolist(), counts.tolist()))}. Using the most common ({lag})."
+            f"{dict(zip(values.tolist(), counts.tolist(), strict=False))}. Using the most common ({lag})."
         )
     buffer_size = lag * slot_samples
     copies = np.unique(
@@ -255,7 +255,8 @@ def find_replayed_buffers(
     first = copies[np.r_[0, breaks + 1]]
     last = copies[np.r_[breaks, len(copies) - 1]]
     intervals = tuple(
-        (int(a * buffer_size), int((z + 1) * buffer_size)) for a, z in zip(first, last)
+        (int(a * buffer_size), int((z + 1) * buffer_size))
+        for a, z in zip(first, last, strict=False)
     )
     return intervals, buffer_size
 
@@ -1279,7 +1280,7 @@ class SyncDataset:
         vsyncs = self.get_falling_edges("vsync_stim", units="seconds")
         idx_for_removal = []
         for idx, (on, off) in enumerate(
-            zip(stim_running_rising_edges, stim_running_falling_edges)
+            zip(stim_running_rising_edges, stim_running_falling_edges, strict=False)
         ):
             if (s := vsyncs[(vsyncs >= on) & (vsyncs <= off)].size) == 1:
                 # keeping this strict for now to only affect one session
@@ -1309,7 +1310,7 @@ class SyncDataset:
         if self.stim_running_edges[0].size == 0:
             return data
         mask = [False] * len(data)
-        for on, off in zip(*self.stim_running_edges):
+        for on, off in zip(*self.stim_running_edges, strict=False):
             mask |= (data >= on) & (data <= off + end_padding)
 
         return data[mask]
@@ -1328,7 +1329,7 @@ class SyncDataset:
         if self.stim_running_edges[0].size == 0:
             return (data,)
         blocks = []
-        for on, off in zip(*self.stim_running_edges):
+        for on, off in zip(*self.stim_running_edges, strict=False):
             blocks.append(data[(data >= on) & (data <= off + end_padding)])
 
         return tuple(blocks)
@@ -1597,7 +1598,7 @@ class SyncDataset:
         if not isinstance(axes, Iterable):
             axes = [axes]
 
-        for bit, ax in zip(bits, axes):
+        for bit, ax in zip(bits, axes, strict=False):
             self.plot_bit(bit, start_time, end_time, auto_show=False, axes=ax)
         # f.set_size_inches(18, 10, forward=True)
         f.subplots_adjust(hspace=0)
@@ -1797,7 +1798,7 @@ def reshape_into_blocks(
 
     gaps_between_blocks = []
     for interval_index, interval in zip(
-        intervals.argsort()[::-1], sorted(intervals)[::-1]
+        intervals.argsort()[::-1], sorted(intervals)[::-1], strict=False
     ):
         if interval > long_interval_threshold:
             # large interval found
