@@ -668,7 +668,8 @@ class SyncDataset:
         else:
             try:
                 self.dfile = h5py.File(path, "r")
-            except OSError:
+            except (OSError, TypeError):
+                # TypeError: UPath is not os.PathLike for remote paths (universal-pathlib>=0.2)
                 path = npc_io.from_pathlike(path)
                 if path.protocol in ("", "file"):
                     self.dfile = h5py.File(io.BytesIO(path.read_bytes()), "r")
