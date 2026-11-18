@@ -11,7 +11,7 @@ Repackaging of `AllenSDK.SyncDataset` with extra functionality, compatible with 
 
 # Usage
 ```bash
-conda create -n npc_sync python>=3.9
+conda create -n npc_sync "python>=3.11"
 conda activate npc_sync
 pip install npc_sync
 ```

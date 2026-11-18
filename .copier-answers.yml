@@ -16,7 +16,7 @@ project_description: Repackaging of AllenSDK.SyncDataset with extra functionalit
 project_name: npc_sync
 python_package_distribution_name: npc-sync
 python_package_import_name: npc_sync
-python_package_requires_python: '>=3.9'
+python_package_requires_python: '>=3.11'
 repository_name: npc_sync
 repository_namespace: AllenInstitute
 

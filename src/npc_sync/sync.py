@@ -16,7 +16,7 @@ import logging
 import os
 import warnings
 from collections.abc import Iterable, Sequence
-from typing import TYPE_CHECKING, Any, Literal, Union
+from typing import TYPE_CHECKING, Any, Literal, Self, TypeAlias, Union
 
 import h5py
 import npc_io
@@ -24,7 +24,6 @@ import npc_session
 import numpy as np
 import numpy.typing as npt
 import upath
-from typing_extensions import Self, TypeAlias
 
 from npc_sync.patch import (
     MEASURED,
