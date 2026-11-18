@@ -401,7 +401,9 @@ class SyncDataset:
     npc_stim (pass stim paths to `npc_stim.get_display_times` instead)."""
 
     patch: SyncPatch | None
-    """Replacement edges inside `invalid_intervals` (see `npc_sync.patch`)."""
+    """Corrections to the recorded edges (see `npc_sync.patch.SyncPatch`): replacement edges
+    inside `invalid_intervals`, and measured edges removed anywhere (photodiode phantom flicker
+    and glitches)."""
 
     on_invalid: OnInvalid
     """What edge queries do on a line whose data inside `invalid_intervals` is not covered by
@@ -499,12 +501,18 @@ class SyncDataset:
         times_samples: npt.NDArray[Any],
         units: str,
     ) -> tuple[npt.NDArray[Any], npt.NDArray[np.int8]]:
-        """Recorded edges (samples) -> edges in `units` after the invalid-interval policy,
-        plus the per-edge source (see `npc_sync.patch.SOURCE_NAMES`)."""
+        """Recorded edges (samples) -> edges in `units` after the patch's removals (any file)
+        and the invalid-interval policy, plus the per-edge source (see
+        `npc_sync.patch.SOURCE_NAMES`)."""
         seconds = units.lower() in ("seconds", "sec", "secs")
         if not seconds and units.lower() != "samples":
             raise ValueError("Only 'samples' or 'seconds' are valid units.")
         fs = self.sample_freq
+        if self.patch is not None and self.patch.removed:
+            # measured edges the patch removes (e.g. photodiode phantom flicker), in any file
+            times_samples = times_samples[
+                self.patch.keep_recorded(self.line_key(line), kind, times_samples)
+            ]
         sources = np.full(len(times_samples), MEASURED, dtype=np.int8)
         if not self.invalid_intervals:
             return (times_samples / fs if seconds else times_samples), sources

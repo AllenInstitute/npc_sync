@@ -35,7 +35,9 @@ import numpy.typing as npt
 
 logger = logging.getLogger(__name__)
 
-PATCH_FORMAT_VERSION = 1
+PATCH_FORMAT_VERSION = 2
+"""2: adds `SyncPatch.removed` (measured edges removed anywhere in the file) and
+`SyncPatch.diode_blocks`. Version-1 patches still load."""
 
 MEASURED: int = 0
 """Edge source: recorded on the sync line (outside any patched span)."""
@@ -659,8 +661,15 @@ def predict_diode_edges(
     span: tuple[float, float],
     diode_box_frame_interval: int,
     window_sec: float = DIODE_LATENCY_WINDOW_SEC,
+    exclude: Iterable[tuple[float, float]] = (),
 ) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64], DiodeSpanSolution]:
-    """Predict digital photodiode edges inside a span from per-frame vsync times.
+    """Predict digital photodiode edges inside a span from per-frame vsync times, for
+    `diode_box_frame_interval` > 1. For box interval 1 use `align_diode_toggles` and
+    `predict_box1_diode_edges`: the pairing rule in step 1 assumes the vsync -> diode latency
+    is shorter than one toggle period, and with box interval 1 it isn't (~20-25 ms vs 16.7 ms),
+    so every edge is paired with the next frame and the pairing breaks at each dropped frame
+    (that caused all 21 'wrong polarity after the span' failures of box-1 spans in the P0
+    manifest: npc_sessions experiments/phantom-flicker/diag_polarity.log).
 
     The diode box toggles on frames f with f % `diode_box_frame_interval` == 0 (TaskControl
     `showFrame`), so consecutive toggle frames produce edges of alternating polarity.
@@ -684,6 +693,10 @@ def predict_diode_edges(
         Recorded edges on the photodiode line, seconds (copies inside the span are ignored).
     span
         The removed span [start, stop).
+    exclude
+        Other spans whose recorded edges are copies: ignored in the windows before and after
+        `span` (they used to be compared with the prediction when two replayed spans were less
+        than `window_sec` apart).
     """
     a, z = span
     ft = np.asarray(frame_times, dtype=float)
@@ -697,7 +710,8 @@ def predict_diode_edges(
     all_e, pol = all_e[o], pol[o]
     inside = in_intervals(all_e, [span])
     n_removed = int(inside.sum())
-    e, pol = all_e[~inside], pol[~inside]
+    copies = in_intervals(all_e, list(exclude)) & ~inside
+    e, pol = all_e[~inside & ~copies], pol[~inside & ~copies]
     pre = (e < a) & (e >= a - window_sec)
     post = (e >= z) & (e < z + window_sec)
     if pre.sum() < 6 or post.sum() < 6 or len(tt) < 2:
@@ -757,6 +771,570 @@ def predict_diode_edges(
             n_polarity_errors_after=n_bad_post,
             n_inserted=int(new.sum()),
             n_removed=n_removed,
+        ),
+    )
+
+
+# ----------------------------------------------------------------------------- photodiode, box 1
+#
+# diodeBoxFrameInterval = 1: every frame inverts the diode box (TaskControl `showFrame`), so frame
+# k's toggle has polarity p_k = p_0 xor (k odd) and appears at v[k] + L(p_k) (v = vsync falling
+# edge, L = per-polarity TTL latency, ~20 ms rising and ~25 ms falling: longer than a refresh).
+# A frame held for n >= 2 refreshes (a dropped frame: stim `frameIntervals[k]`) must show no
+# toggle until frame k+1's. Edges inside the hold are *phantom flicker*: the display re-presents
+# the other buffer during the stall (old npc_sync sync.py: "phantom"/"spontaneous flicker").
+# Evidence, 442 cached Task 2 pilot sessions (npc_sessions experiments/phantom-flicker):
+# 3,952 phantom edges in 39 box-1 blocks, all in holds of >= 3 refreshes, always an even number
+# (state-restoring pairs) and at most n - 1 per hold; none in 203,646 holds of 2 refreshes; all 39
+# blocks were rejected by npc_stim's flip-count check. Their amplitude changes over a session:
+# below the TTL threshold they don't register, but the next toggle can come up to ~9 ms early.
+
+DIODE_TOGGLE = 0
+DIODE_GLITCH = 1
+DIODE_PHANTOM_FLICKER = 2
+DIODE_UNEXPLAINED = 3
+DIODE_OUTSIDE = 4
+DIODE_EDGE_CLASSES = {
+    DIODE_TOGGLE: "toggle",
+    DIODE_GLITCH: "glitch",
+    DIODE_PHANTOM_FLICKER: "phantom_flicker",
+    DIODE_UNEXPLAINED: "unexplained",
+    DIODE_OUTSIDE: "outside",
+}
+"""Classes of photodiode edges in a box-1 block (`align_diode_toggles`):
+
+- toggle: frame k's toggle edge
+- glitch: comparator chatter, consecutive edges < `DIODE_GLITCH_MAX_SEC` apart. Not a display
+  change: the display changes at most once per refresh.
+- phantom_flicker: state-restoring pairs strictly between the toggles of frame k and k+1, where
+  frame k is held for n >= 3 refreshes, at most n - 1 edges (one per missed refresh)
+- unexplained: any other edge between the first and last matched toggles
+- outside: before the first or after the last matched toggle (e.g. the screen returning to grey)
+"""
+
+DIODE_GLITCH_MAX_SEC = 0.05 / 59.95
+"""Same threshold as npc_stim's `DEFINITE_SHORT_INTERVAL_THRESHOLD` (0.83 ms)."""
+HELD_FRAME_MIN_REFRESHES = 1.5
+"""A stim frame interval at least this many refreshes long is a held (dropped) frame."""
+DIODE_OFF_GRID_FRACTION = 0.1
+"""A stim frame interval more than this fraction of a refresh from a whole number of refreshes is
+off the refresh grid: a late `flip()` return at one of its ends (the frame-signal falling edge
+and PsychoPy's frame interval are late; the frame was displayed on time)."""
+DIODE_LANDMARK_LATENCY_RANGE_SEC = (0.005, 0.035)
+"""Latency accepted for a landmark. Block medians: rising 19.5-20.4 ms, falling 23.4-25.9 ms
+(survey_blocks.csv); one refresh more (>= 36 ms) is excluded: a late `flip()` return produces that
+alias (stim interval k long, diode interval k+1 long)."""
+DIODE_LANDMARK_LENGTH_TOL_REFRESHES = 0.5
+DIODE_MIN_LANDMARKS = 3
+DIODE_MIN_LANDMARK_AGREEMENT = 0.9
+DIODE_LANDMARK_AGREEMENT_TOL_SEC = 0.008
+"""A landmark agrees if its latency is within this of its polarity's mode. The latency drifts and
+can switch between two states ~5.5 ms apart within a block (falling 23 vs 28.5 ms in
+DRpilot_674562_20231004 block 6); an alias is a refresh (16.7 ms) away."""
+DIODE_MAX_POLARITY_LATENCY_DIFF_SEC = 0.008
+"""Rising and falling latencies differ by the TTL threshold asymmetry, never by a refresh."""
+DIODE_TOGGLE_FIRST_PASS_TOL_SEC = 0.008
+DIODE_TOGGLE_MATCH_TOL_SEC = 0.012
+"""A toggle edge must be within this of its expected time: toggles after a hold can be ~9 ms
+early (sub-threshold phantom flicker), and after-stall TTL edges late."""
+DIODE_MIN_DISPLAY_AFTER_RISE_SEC = 0.015
+"""A frame can't be displayed before its frame-signal rising edge + this (npc_stim
+`MIN_VSYNC_DIODE_FLIP_SEPARATION_SEC`; >= 20.9 ms in 2.2 M analog-checked toggles). Lower bound of
+the second matching pass, for frames whose falling edge is late."""
+DIODE_AFTER_STALL_RESIDUAL_SEC = 0.25 / 59.95
+"""Toggle residuals beyond this explain a disagreement of the long-interval check
+(`DiodeToggleAlignment.long_interval_mismatch`) as a TTL timing deviation."""
+DIODE_MIN_SEGMENT_TOGGLES = 3
+DIODE_BLOCK_END_PADDING_SEC = 0.5
+"""Diode edges up to this long after a block's last vsync are aligned with the block."""
+DIODE_BOUNDARY_FRAMES = 1
+"""A missing toggle in the first or last this-many frames of a block doesn't fail the check: the
+first frame's toggle can be hidden by the transition from the initializing screen (npc_stim
+corrects the whole-block offset), the last by the return to the grey screen."""
+
+
+class DiodeOffsetUndetermined(ReconciliationError):
+    """No (or too few, or inconsistent) long stim frame intervals show as long diode intervals:
+    the frame <-> edge offset can't be fixed from the diode."""
+
+
+@dataclasses.dataclass
+class DiodeToggleAlignment:
+    """Assignment of photodiode edges to the toggle frames of one box-1 block (see
+    `align_diode_toggles`)."""
+
+    edge_times: npt.NDArray[np.float64]
+    edge_rising: npt.NDArray[np.bool_]
+    edge_class: npt.NDArray[np.int8]
+    """Per edge: `DIODE_EDGE_CLASSES` key."""
+    edge_frame: npt.NDArray[np.intp]
+    """Per edge: the frame whose toggle it is (toggle), the held frame whose hold it is in
+    (phantom flicker), the frame before it (unexplained), else -1."""
+    frame_edge: npt.NDArray[np.intp]
+    """Per frame: index of its toggle edge, or -1."""
+    frame_rising: npt.NDArray[np.bool_]
+    """Per frame: polarity of its toggle."""
+    expected: npt.NDArray[np.float64]
+    """Per frame: expected toggle time (frame time + local per-polarity latency), seconds."""
+    residual: npt.NDArray[np.float64]
+    """Per frame: toggle edge - expected (NaN if unmatched)."""
+    unobserved: npt.NDArray[np.bool_]
+    """Per frame: unmatched, with the expected toggle in or next to an `unobserved` interval."""
+    second_pass: npt.NDArray[np.intp]
+    """Frames matched only in the second pass (late `flip()` return)."""
+    refresh_sec: float
+    n_refreshes: npt.NDArray[np.int_]
+    """round(frameIntervals / refresh) per frame interval."""
+    n_landmarks: int
+    n_landmarks_disagree: int
+    long_interval_mismatch: dict[str, npt.NDArray[np.intp]]
+    """Long-interval check: frame intervals k where stim (>= 1.5 refreshes) and diode
+    (latency-corrected toggle-to-toggle interval >= 1.5 refreshes) disagree, by cause:
+    'late_return' (stim interval k or a neighbour off the refresh grid), 'after_stall' (toggle k
+    or k+1 off its expected time by > `DIODE_AFTER_STALL_RESIDUAL_SEC`), 'other'."""
+
+    def count(self, edge_class: int) -> int:
+        return int((self.edge_class == edge_class).sum())
+
+    @property
+    def missing_frames(self) -> npt.NDArray[np.intp]:
+        """Frames with no toggle edge, excluding unobserved ones."""
+        return np.flatnonzero((self.frame_edge < 0) & ~self.unobserved)
+
+    @property
+    def interior_missing_frames(self) -> npt.NDArray[np.intp]:
+        m = self.missing_frames
+        n = len(self.frame_edge)
+        return m[(m >= DIODE_BOUNDARY_FRAMES) & (m < n - DIODE_BOUNDARY_FRAMES)]
+
+    @property
+    def removable(self) -> npt.NDArray[np.intp]:
+        """Indices of edges to remove: glitches and phantom flicker."""
+        return np.flatnonzero(
+            (self.edge_class == DIODE_GLITCH) | (self.edge_class == DIODE_PHANTOM_FLICKER)
+        )
+
+    def failures(self) -> list[str]:
+        """Why the block's diode edges can't be explained (empty: they can)."""
+        out = []
+        if n := self.count(DIODE_UNEXPLAINED):
+            out.append(
+                f"{n} diode edge(s) are neither a frame's toggle, nor phantom flicker inside a "
+                "held frame, nor a comparator glitch"
+            )
+        if n := len(self.interior_missing_frames):
+            out.append(f"{n} toggle frame(s) have no diode edge")
+        if n := len(self.long_interval_mismatch["other"]):
+            out.append(
+                f"{n} frame interval(s) where the stim file and the diode disagree on a held frame"
+            )
+        return out
+
+    def summary(self) -> dict[str, Any]:
+        return {
+            **{DIODE_EDGE_CLASSES[c]: self.count(c) for c in DIODE_EDGE_CLASSES},
+            "missing_frames": len(self.missing_frames),
+            "missing_boundary_frames": len(self.missing_frames)
+            - len(self.interior_missing_frames),
+            "unobserved_frames": int(self.unobserved.sum()),
+            "held_frames": int((self.n_refreshes >= 2).sum()),
+            "holds_with_phantom_flicker": int(
+                len(np.unique(self.edge_frame[self.edge_class == DIODE_PHANTOM_FLICKER]))
+            ),
+            "second_pass_toggles": len(self.second_pass),
+            "landmarks": self.n_landmarks,
+            "landmarks_disagree": self.n_landmarks_disagree,
+            "first_frame_rising": bool(self.frame_rising[0]) if len(self.frame_rising) else None,
+            "latency_rising_ms": _nanmedian_ms(self.expected - self._frame_times, self.frame_rising),
+            "latency_falling_ms": _nanmedian_ms(self.expected - self._frame_times, ~self.frame_rising),
+            "long_interval_mismatch": {k: len(v) for k, v in self.long_interval_mismatch.items()},
+            "max_abs_toggle_residual_ms": float(np.nanmax(np.abs(self.residual)) * 1e3)
+            if np.isfinite(self.residual).any()
+            else None,
+        }
+
+    _frame_times: npt.NDArray[np.float64] = dataclasses.field(
+        default_factory=lambda: np.array([]), repr=False
+    )
+
+
+def _nanmedian_ms(x: npt.NDArray, mask: npt.NDArray) -> float | None:
+    v = x[mask & np.isfinite(x)]
+    return float(np.median(v) * 1e3) if len(v) else None
+
+
+def diode_glitch_mask(
+    edge_times: npt.ArrayLike, max_sec: float = DIODE_GLITCH_MAX_SEC
+) -> npt.NDArray[np.bool_]:
+    """Edges to remove as comparator chatter: clusters of consecutive edges less than `max_sec`
+    apart. An even cluster is removed whole (a pulse); an odd cluster keeps its last edge (a
+    transition with chatter; npc_stim's anomalous-interval removal also kept the last).
+
+    >>> diode_glitch_mask([0.0, 1.0, 1.0001, 1.0002, 2.0, 3.0, 3.0003]).tolist()
+    [False, True, True, False, False, True, True]
+    """
+    e = np.asarray(edge_times, dtype=float)
+    out = np.zeros(len(e), bool)
+    if len(e) < 2:
+        return out
+    close = np.diff(e) < max_sec
+    i = 0
+    while i < len(close):
+        if not close[i]:
+            i += 1
+            continue
+        j = i
+        while j < len(close) and close[j]:
+            j += 1
+        n = j - i + 1  # edges i..j
+        out[i : j + 1 - (n % 2)] = True
+        i = j + 1
+    return out
+
+
+def _diode_landmarks(
+    v: npt.NDArray, fi: npt.NDArray, e: npt.NDArray, q: npt.NDArray, R: float,
+    unobserved: Sequence[tuple[float, float]],
+) -> tuple[npt.NDArray, npt.NDArray, npt.NDArray]:
+    """(latency, polarity, frame) of each landmark: a diode interval >= 1.5 refreshes whose
+    length matches (within half a refresh) a held frame k on the refresh grid, starting within
+    `DIODE_LANDMARK_LATENCY_RANGE_SEC` after v[k]: its first edge is frame k's toggle."""
+    frac = np.abs(fi / R - np.round(fi / R))
+    on = frac <= DIODE_OFF_GRID_FRACTION
+    on_nb = on & np.r_[True, on[:-1]] & np.r_[on[1:], True]
+    long_k = np.flatnonzero((fi >= HELD_FRAME_MIN_REFRESHES * R) & on_nb & np.isfinite(v[:-1]))
+    d = np.diff(e)
+    long_j = np.flatnonzero(d >= HELD_FRAME_MIN_REFRESHES * R)
+    if unobserved:  # a diode interval across a removed span is not a hold
+        long_j = long_j[~np.array([any(a < e[j + 1] and z > e[j] for a, z in unobserved) for j in long_j], bool)]
+    vs = v[long_k]
+    lo_l, hi_l = DIODE_LANDMARK_LATENCY_RANGE_SEC
+    offs, pols, ks = [], [], []
+    for j in long_j:
+        lo = np.searchsorted(vs, e[j] - hi_l)
+        hi = np.searchsorted(vs, e[j] - lo_l, side="right")
+        for i in range(lo, hi):
+            k = long_k[i]
+            if abs(d[j] - fi[k]) < DIODE_LANDMARK_LENGTH_TOL_REFRESHES * R:
+                offs.append(e[j] - v[k])
+                pols.append(q[j])
+                ks.append(k)
+    return np.array(offs, float), np.array(pols, bool), np.array(ks, int)
+
+
+def _diode_landmark_offset(
+    v: npt.NDArray, fi: npt.NDArray, e: npt.NDArray, q: npt.NDArray, R: float,
+    unobserved: Sequence[tuple[float, float]],
+) -> tuple[int, float, float, int, int]:
+    """(parity of frames with rising toggles, L_rising, L_falling, n landmarks agreeing, n
+    disagreeing). Raises `DiodeOffsetUndetermined`."""
+    offs, pols, ks = _diode_landmarks(v, fi, e, q, R, unobserved)
+    if len(offs) == 0:
+        raise DiodeOffsetUndetermined("no long diode interval matches a held frame")
+    lo_l, hi_l = DIODE_LANDMARK_LATENCY_RANGE_SEC
+    bins = np.arange(lo_l, hi_l + 0.0005, 0.0005)
+
+    def mode(x: npt.NDArray) -> float:
+        hs = np.convolve(np.histogram(x, bins)[0], np.ones(5), mode="same")
+        return float(bins[np.argmax(hs)] + 0.00025)
+
+    modes = {pol: mode(offs[pols == pol]) for pol in (True, False) if (pols == pol).any()}
+    if len(modes) == 2 and abs(modes[True] - modes[False]) > DIODE_MAX_POLARITY_LATENCY_DIFF_SEC:
+        raise DiodeOffsetUndetermined(
+            f"rising and falling landmark latencies differ by {abs(modes[True] - modes[False]) * 1e3:.1f} ms"
+        )
+    fallback = next(iter(modes.values()))
+    ref = np.array([modes.get(p, fallback) for p in pols])
+    agree = np.abs(offs - ref) <= DIODE_LANDMARK_AGREEMENT_TOL_SEC
+    if agree.sum() < DIODE_MIN_LANDMARKS or agree.mean() < DIODE_MIN_LANDMARK_AGREEMENT:
+        raise DiodeOffsetUndetermined(
+            f"{int(agree.sum())} of {len(offs)} landmarks agree on the latency (need >= "
+            f"{DIODE_MIN_LANDMARKS} and >= {DIODE_MIN_LANDMARK_AGREEMENT:.0%})"
+        )
+    Lr = float(np.median(offs[agree & pols])) if (agree & pols).any() else modes.get(True, fallback)
+    Lf = float(np.median(offs[agree & ~pols])) if (agree & ~pols).any() else modes.get(False, fallback)
+    # frames with rising toggles: rising landmarks are toggles of such frames
+    par = np.where(pols[agree], ks[agree] % 2, 1 - ks[agree] % 2)
+    if min(par.mean(), 1 - par.mean()) > 1 - DIODE_MIN_LANDMARK_AGREEMENT:
+        raise DiodeOffsetUndetermined("landmarks disagree on which frames have rising toggles")
+    return int(np.round(par.mean())), Lr, Lf, int(agree.sum()), int((~agree).sum())
+
+
+def _match_toggles(
+    t: npt.NDArray, p_rising: npt.NDArray, e: npt.NDArray, q: npt.NDArray, tol: float,
+    early: npt.NDArray | None = None,
+) -> npt.NDArray[np.intp]:
+    """frame -> edge index (or -1). Each frame takes the edge of its polarity nearest its
+    expected time t within [t - tol - early, t + tol]; an edge claimed by two frames goes to the
+    nearer. Frames with non-finite t are not matched."""
+    fe = np.full(len(t), -1, np.intp)
+    early = np.zeros(len(t)) if early is None else early
+    for pol in (True, False):
+        ks = np.flatnonzero((p_rising == pol) & np.isfinite(t))
+        js = np.flatnonzero(q == pol)
+        if len(ks) == 0 or len(js) == 0:
+            continue
+        ee, tk = e[js], t[ks]
+        lo = np.searchsorted(ee, tk - tol - early[ks])
+        hi = np.searchsorted(ee, tk + tol, side="right")
+        best = np.full(len(ks), -1, np.intp)
+        dist = np.full(len(ks), np.inf)
+        for off in range(int(np.max(hi - lo))):
+            c = lo + off
+            d = np.where(c < hi, np.abs(ee[np.clip(c, 0, len(ee) - 1)] - tk), np.inf)
+            better = d < dist
+            best[better], dist[better] = c[better], d[better]
+        m = best >= 0
+        if m.any():
+            idx = np.flatnonzero(m)[np.lexsort((dist[m], best[m]))]
+            dup = np.r_[False, best[idx][1:] == best[idx][:-1]]
+            best[idx[dup]] = -1
+        fe[ks[best >= 0]] = js[best[best >= 0]]
+    return fe
+
+
+def _segment_correction(
+    res: npt.NDArray, p_rising: npt.NDArray, seg: npt.NDArray, n_seg: int
+) -> npt.NDArray:
+    """Per-frame latency correction: median residual per (segment, polarity), carried forward
+    (then backward) into segments with too few matched toggles."""
+    out = np.zeros(len(res))
+    for pol in (True, False):
+        sel = (p_rising == pol) & np.isfinite(res)
+        med = np.full(n_seg, np.nan)
+        if sel.any():
+            s, r = seg[sel], res[sel]
+            order = np.argsort(s, kind="stable")
+            s, r = s[order], r[order]
+            bounds = np.searchsorted(s, np.arange(n_seg + 1))
+            for i in range(n_seg):
+                a, z = bounds[i], bounds[i + 1]
+                if z - a >= DIODE_MIN_SEGMENT_TOGGLES:
+                    med[i] = np.median(r[a:z])
+        ok = np.flatnonzero(np.isfinite(med))
+        if len(ok):
+            # nearest earlier segment with a value, else the nearest later one
+            j = np.searchsorted(ok, np.arange(n_seg), side="right") - 1
+            filled = np.where(j >= 0, med[ok[np.clip(j, 0, None)]], med[ok[0]])
+        else:
+            filled = np.zeros(n_seg)
+        out[p_rising == pol] = filled[seg[p_rising == pol]]
+    return out
+
+
+def align_diode_toggles(
+    frame_times: npt.ArrayLike,
+    frame_intervals: npt.ArrayLike,
+    edge_times: npt.ArrayLike,
+    edge_rising: npt.ArrayLike,
+    frame_signal_rising: npt.ArrayLike | None = None,
+    unobserved: Iterable[tuple[float, float]] = (),
+) -> DiodeToggleAlignment:
+    """Align the photodiode edges of one box-1 block (diodeBoxFrameInterval = 1) with its
+    frames, and classify every edge (`DIODE_EDGE_CLASSES`).
+
+    1. Comparator glitches (consecutive edges < `DIODE_GLITCH_MAX_SEC` apart) are set aside.
+    2. Frame <-> edge offset from landmarks (`_diode_landmarks`): with box interval 1 it can't be
+       found from regular frames (v[k] + L ~ v[k+1] + L - R). Raises `DiodeOffsetUndetermined`
+       if there are fewer than 3 consistent landmarks.
+    3. Per-polarity latency, piecewise constant between held frames (it can switch at a stall).
+    4. Each frame's toggle: the edge of its polarity nearest its expected time, within
+       `DIODE_TOGGLE_MATCH_TOL_SEC`; frames left unmatched get a second pass down to their
+       frame-signal rising edge + `DIODE_MIN_DISPLAY_AFTER_RISE_SEC` (late `flip()` return).
+    5. Edges between the toggles of frames k and k+1 are phantom flicker if frame k is held for
+       n >= 3 refreshes and they are an even number <= n - 1; otherwise unexplained.
+    6. Long-interval check (`DiodeToggleAlignment.long_interval_mismatch`).
+
+    Parameters
+    ----------
+    frame_times
+        Per stim frame: vsync falling edge (seconds), measured or reconstructed
+        (`VsyncReconciliation.times`). One per stim frame.
+    frame_intervals
+        The stim file's `frameIntervals`.
+    edge_times, edge_rising
+        Measured photodiode edges of the block (sorted) and their polarity. Edges inside
+        `unobserved` are ignored.
+    frame_signal_rising
+        Per frame: the frame-signal (vsync line) rising edge before its falling edge, or NaN.
+    unobserved
+        Intervals without measured edges (replayed spans): frames whose toggle falls there are
+        not counted as missing.
+    """
+    v = np.asarray(frame_times, dtype=float)
+    fi = np.asarray(frame_intervals, dtype=float)
+    N = len(v)
+    if len(fi) != N - 1:
+        raise ValueError(f"{N} frame times but {len(fi)} frame intervals")
+    if not np.isfinite(v).all():
+        raise ValueError("frame times must be finite (reconcile the vsyncs first)")
+    spans = list(merge_intervals(unobserved))
+    e_all = np.asarray(edge_times, dtype=float)
+    q_all = np.asarray(edge_rising, dtype=bool)
+    keep_in = ~in_intervals(e_all, spans)
+    e_all, q_all = e_all[keep_in], q_all[keep_in]
+    R = float(np.median(fi))
+    nref = np.round(fi / R).astype(int)
+    gl = diode_glitch_mask(e_all)
+    keep = np.flatnonzero(~gl)
+    e, q = e_all[keep], q_all[keep]
+    c_r, Lr, Lf, n_agree, n_dis = _diode_landmark_offset(v, fi, e, q, R, spans)
+    p_rising = (np.arange(N) % 2) == c_r
+    # a new segment starts after every held frame
+    seg = np.concatenate([[0], np.cumsum(fi >= HELD_FRAME_MIN_REFRESHES * R)])
+    n_seg = int(seg[-1]) + 1
+    base = np.where(p_rising, Lr, Lf)
+    corr = np.zeros(N)
+    for tol in (DIODE_TOGGLE_FIRST_PASS_TOL_SEC, DIODE_TOGGLE_MATCH_TOL_SEC):
+        t = v + base + corr
+        fe = _match_toggles(t, p_rising, e, q, tol)
+        res = np.where(fe >= 0, e[np.clip(fe, 0, None)] - t, np.nan)
+        corr = corr + _segment_correction(res, p_rising, seg, n_seg)
+    t = v + base + corr
+    fe = _match_toggles(t, p_rising, e, q, DIODE_TOGGLE_MATCH_TOL_SEC)
+    second = np.array([], np.intp)
+    if frame_signal_rising is not None:
+        vr = np.asarray(frame_signal_rising, dtype=float)
+        un = np.flatnonzero(fe < 0)
+        used = np.zeros(len(e), bool)
+        used[fe[fe >= 0]] = True
+        early = t[un] - DIODE_TOGGLE_MATCH_TOL_SEC - (vr[un] + DIODE_MIN_DISPLAY_AFTER_RISE_SEC)
+        early = np.where(np.isfinite(early), np.clip(early, 0, None), 0.0)
+        free = np.flatnonzero(~used)
+        fe2 = _match_toggles(t[un], p_rising[un], e[free], q[free], DIODE_TOGGLE_MATCH_TOL_SEC, early)
+        take = fe2 >= 0
+        fe[un[take]] = free[fe2[take]]
+        second = un[take]
+    # toggles must be in frame order: unmatch any out-of-order pair (rare)
+    m = np.flatnonzero(fe >= 0)
+    bad = np.flatnonzero(np.diff(fe[m]) <= 0)
+    fe[m[bad]] = -1
+    fe[m[bad + 1]] = -1
+    m = np.flatnonzero(fe >= 0)
+    residual = np.where(fe >= 0, e[np.clip(fe, 0, None)] - t, np.nan)
+    near_span = in_intervals(t, [(a - DIODE_TOGGLE_MATCH_TOL_SEC, z + DIODE_TOGGLE_MATCH_TOL_SEC) for a, z in spans])
+    unobserved_frames = (fe < 0) & near_span
+    # classify
+    M = len(e)
+    cls = np.full(M, DIODE_UNEXPLAINED, np.int8)
+    ef = np.full(M, -1, np.intp)
+    cls[fe[m]] = DIODE_TOGGLE
+    ef[fe[m]] = m
+    if len(m):
+        cls[: fe[m[0]]] = DIODE_OUTSIDE
+        cls[fe[m[-1]] + 1 :] = DIODE_OUTSIDE
+        for g in np.flatnonzero(np.diff(fe[m]) > 1):
+            ka, kb = m[g], m[g + 1]
+            between = np.arange(fe[ka] + 1, fe[kb])
+            ef[between] = ka
+            if (
+                kb == ka + 1
+                and nref[ka] >= 3
+                and len(between) <= nref[ka] - 1
+                and len(between) % 2 == 0
+            ):
+                cls[between] = DIODE_PHANTOM_FLICKER
+    else:
+        cls[:] = DIODE_OUTSIDE
+    # long-interval check on latency-corrected toggle-to-toggle intervals
+    both = np.flatnonzero((fe[:-1] >= 0) & (fe[1:] >= 0))
+    ct = np.where(fe >= 0, e[np.clip(fe, 0, None)] - (t - v), np.nan)
+    d_long = (ct[both + 1] - ct[both]) >= HELD_FRAME_MIN_REFRESHES * R
+    s_long = fi[both] >= HELD_FRAME_MIN_REFRESHES * R
+    mm = both[d_long != s_long]
+    off_grid = np.r_[np.abs(fi / R - np.round(fi / R)) > DIODE_OFF_GRID_FRACTION, False]
+    big = np.abs(np.nan_to_num(residual)) > DIODE_AFTER_STALL_RESIDUAL_SEC
+    late = off_grid[mm] | off_grid[np.clip(mm - 1, 0, None)] | off_grid[mm + 1]
+    after = ~late & (big[mm] | big[mm + 1])
+    long_mismatch = {"late_return": mm[late], "after_stall": mm[after], "other": mm[~late & ~after]}
+    # back to the caller's edge indices (glitches included)
+    edge_class = np.full(len(e_all), DIODE_GLITCH, np.int8)
+    edge_class[keep] = cls
+    edge_frame = np.full(len(e_all), -1, np.intp)
+    edge_frame[keep] = ef
+    return DiodeToggleAlignment(
+        edge_times=e_all,
+        edge_rising=q_all,
+        edge_class=edge_class,
+        edge_frame=edge_frame,
+        frame_edge=np.where(fe >= 0, keep[np.clip(fe, 0, None)], -1),
+        frame_rising=p_rising,
+        expected=t,
+        residual=residual,
+        unobserved=unobserved_frames,
+        second_pass=second,
+        refresh_sec=R,
+        n_refreshes=nref,
+        n_landmarks=n_agree,
+        n_landmarks_disagree=n_dis,
+        long_interval_mismatch=long_mismatch,
+        _frame_times=v,
+    )
+
+
+def predict_box1_diode_edges(
+    alignment: DiodeToggleAlignment,
+    span: tuple[float, float],
+    n_removed: int = 0,
+    window_sec: float = DIODE_LATENCY_WINDOW_SEC,
+) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64], DiodeSpanSolution]:
+    """Photodiode edges inside a replayed span of a box-1 block, from a block alignment made with
+    the span `unobserved` (`align_diode_toggles`).
+
+    Predicted edges: the expected toggle (frame time + local per-polarity latency) of every
+    unobserved frame near the span; held frames get no toggle until the next frame's (phantom
+    flicker can't be predicted and isn't a frame). Measured toggles are kept, and phantom flicker
+    and glitches next to the span are removed with the block's cleaning (see `build_sync_patch`).
+
+    Checks (`DiodeSpanSolution.failures`): the alignment holds across the span (frame count and
+    polarity: measured edges in `window_sec` after it that aren't toggles, phantom flicker or
+    glitches count as polarity errors, as do missing toggles), and the toggles in the
+    `DIODE_CHECK_WINDOW_SEC` after the span are as close to their expected times as those in
+    `window_sec` before it (+ `DIODE_MAX_RESIDUAL_ABOVE_BASELINE_SEC`). The first toggle after a
+    held frame and late `flip()` returns are left out of both, since their TTL timing deviates
+    for reasons the prediction can't model.
+    """
+    al = alignment
+    a, z = span
+    ft = al._frame_times
+    N = len(ft)
+    t = al.expected
+    near = in_intervals(t, [(a - DIODE_TOGGLE_MATCH_TOL_SEC, z + DIODE_TOGGLE_MATCH_TOL_SEC)])
+    pred = np.flatnonzero(near & al.unobserved)
+    after_hold = np.r_[False, al.n_refreshes >= 2]
+    regular = (al.frame_edge >= 0) & ~after_hold
+    regular[al.second_pass] = False
+    e_t = np.where(al.frame_edge >= 0, al.edge_times[np.clip(al.frame_edge, 0, None)], np.nan)
+    pre = regular & (e_t < a) & (e_t >= a - window_sec)
+    post = regular & (e_t >= z) & (e_t < z + DIODE_CHECK_WINDOW_SEC)
+    lat_r = _nanmedian_ms((t - ft)[near | pre], al.frame_rising[near | pre])
+    lat_f = _nanmedian_ms((t - ft)[near | pre], ~al.frame_rising[near | pre])
+    common = dict(
+        latency_rising_sec=(lat_r or np.nan) / 1e3,
+        latency_falling_sec=(lat_f or np.nan) / 1e3,
+        n_removed=n_removed,
+    )
+    if pre.sum() < 6 or post.sum() < 1:
+        return np.array([]), np.array([]), DiodeSpanSolution(
+            span, "failed", reason="too few measured diode toggles near the span", **common
+        )
+    after_win = (al.edge_times >= z) & (al.edge_times < z + window_sec)
+    n_bad = int((after_win & (al.edge_class == DIODE_UNEXPLAINED)).sum())
+    frames_after = np.flatnonzero((t >= z) & (t < z + window_sec))
+    n_missing = int(np.isin(frames_after, al.missing_frames).sum())
+    rising = pred[al.frame_rising[pred]]
+    falling = pred[~al.frame_rising[pred]]
+    return (
+        t[rising],
+        t[falling],
+        DiodeSpanSolution(
+            span,
+            "reconstructed",
+            baseline_error_sec=float(np.max(np.abs(al.residual[pre]))),
+            after_error_sec=float(np.max(np.abs(al.residual[post]))),
+            n_polarity_errors_after=n_bad + n_missing,
+            n_inserted=len(pred),
+            **common,
         ),
     )
 
@@ -823,16 +1401,101 @@ class SyncFault:
 
 
 @dataclasses.dataclass
+class RemovedEdges:
+    """Measured edges removed from one line, anywhere in the file (not tied to invalid
+    intervals): e.g. phantom flicker and comparator glitches on the photodiode line."""
+
+    reason: str
+    """'phantom_flicker' or 'glitch' (see `DIODE_EDGE_CLASSES`)."""
+    block_index: int
+    """Vsync block the edges belong to (`SyncDataset.vsync_times_in_blocks`)."""
+    rising_samples: npt.NDArray[np.int64] = dataclasses.field(
+        default_factory=lambda: np.array([], dtype=np.int64)
+    )
+    falling_samples: npt.NDArray[np.int64] = dataclasses.field(
+        default_factory=lambda: np.array([], dtype=np.int64)
+    )
+    """Sample indices of the removed edges, as recorded."""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "reason": self.reason,
+            "block_index": int(self.block_index),
+            "rising_samples": [int(x) for x in self.rising_samples],
+            "falling_samples": [int(x) for x in self.falling_samples],
+        }
+
+    @classmethod
+    def from_dict(cls, d: Mapping[str, Any]) -> RemovedEdges:
+        return cls(
+            reason=d["reason"],
+            block_index=int(d["block_index"]),
+            rising_samples=np.asarray(d["rising_samples"], dtype=np.int64),
+            falling_samples=np.asarray(d["falling_samples"], dtype=np.int64),
+        )
+
+
+DiodeBlockStatus = Literal["cleaned", "rejected", "not_checked"]
+
+
+@dataclasses.dataclass
+class DiodeBlockPatch:
+    """Outcome of checking one vsync block's photodiode edges against its stim file.
+
+    - 'cleaned': every edge is explained (`align_diode_toggles`). Phantom flicker and glitches
+      (if any) are removed through `SyncPatch.removed`; consumers use the line as patched and
+      must not remove further edges (npc_stim skips its own anomalous-flip removal).
+    - 'rejected': edges that are none of a toggle, phantom flicker or a glitch, or toggle frames
+      without an edge. Nothing is removed; consumers must not compute display times.
+    - 'not_checked': not applicable or not possible (diodeBoxFrameInterval > 1, no held frames to
+      fix the frame <-> edge offset, vsync count != stim frames, ...). Consumers keep their own
+      handling.
+    """
+
+    block_index: int
+    start: float
+    """First vsync of the block (s)."""
+    stop: float
+    """Last vsync of the block (s)."""
+    status: DiodeBlockStatus
+    reason: str = ""
+    stim: str = ""
+    diode_box_frame_interval: int | None = None
+    diagnostics: dict[str, Any] = dataclasses.field(default_factory=dict)
+    """Edge class counts, latencies, landmarks, long-interval check (JSON-serialisable)."""
+
+    @property
+    def n_phantom_flicker(self) -> int:
+        return int(self.diagnostics.get("phantom_flicker", 0) or 0)
+
+    @property
+    def n_glitch(self) -> int:
+        return int(self.diagnostics.get("glitch", 0) or 0)
+
+    def to_dict(self) -> dict[str, Any]:
+        return _jsonable(dataclasses.asdict(self))
+
+    @classmethod
+    def from_dict(cls, d: Mapping[str, Any]) -> DiodeBlockPatch:
+        return cls(**{k: d[k] for k in d if k in {f.name for f in dataclasses.fields(cls)}})
+
+
+@dataclasses.dataclass
 class SyncPatch:
-    """Per-line replacement edges inside invalid intervals of one sync file.
+    """Corrections to the recorded edges of one sync file.
 
-    Apply with `SyncDataset(path, patch=patch)`. A line with a `SpanPatch` for every invalid
-    interval returns measured edges outside the spans plus the patch's edges inside; spans with
-    status 'unknown' return nothing inside (see `SyncDataset.get_unknown_intervals`). A line
-    without patches raises on edge queries (unless `on_invalid` is relaxed).
+    - `lines`: per-line replacement edges inside invalid (replayed) intervals. A line with a
+      `SpanPatch` for every invalid interval returns measured edges outside the spans plus the
+      patch's edges inside; spans with status 'unknown' return nothing inside (see
+      `SyncDataset.get_unknown_intervals`). A line without patches raises on edge queries
+      (unless `on_invalid` is relaxed).
+    - `removed`: measured edges removed anywhere in the file, including files with no invalid
+      intervals (photodiode phantom flicker and glitches).
+    - `diode_blocks`: per vsync block, whether its photodiode edges were checked and cleaned
+      (`DiodeBlockPatch`).
 
-    The patch is keyed to the sync file's content hash (`SyncDataset.content_hash`) and records
-    the builder that made it.
+    Apply with `SyncDataset(path, patch=patch)`. The patch is keyed to the sync file's content
+    hash (`SyncDataset.content_hash`) and records the builder that made it.
     """
 
     sync_content_hash: str
@@ -847,8 +1510,36 @@ class SyncPatch:
         )
     )
     notes: list[str] = dataclasses.field(default_factory=list)
+    removed: dict[str, list[RemovedEdges]] = dataclasses.field(default_factory=dict)
+    """line label -> measured edges removed."""
+    diode_blocks: list[DiodeBlockPatch] = dataclasses.field(default_factory=list)
 
     # application ---------------------------------------------------------------------- #
+
+    def removed_samples(self, line: str, kind: Literal["rising", "falling"]) -> npt.NDArray[np.int64]:
+        """Sample indices of the measured `kind` edges removed from `line`."""
+        parts = [
+            r.rising_samples if kind == "rising" else r.falling_samples
+            for r in self.removed.get(line, [])
+        ]
+        return np.unique(np.concatenate(parts)).astype(np.int64) if parts else np.array([], dtype=np.int64)
+
+    def keep_recorded(
+        self, line: str, kind: Literal["rising", "falling"], recorded_samples: npt.ArrayLike
+    ) -> npt.NDArray[np.bool_]:
+        """Mask of recorded edges (sample indices) that aren't removed by this patch."""
+        rec = np.asarray(recorded_samples)
+        removed = self.removed_samples(line, kind)
+        if not removed.size:
+            return np.ones(rec.shape, dtype=bool)
+        return ~np.isin(np.round(rec).astype(np.int64), removed)
+
+    def diode_block(self, start: float, stop: float) -> DiodeBlockPatch | None:
+        """The diode record whose block overlaps [start, stop] (vsync times, seconds)."""
+        for b in self.diode_blocks:
+            if b.start <= stop and b.stop >= start:
+                return b
+        return None
 
     def covers(self, line: str) -> bool:
         """Whether every invalid interval is covered by a span of this line's patch."""
@@ -899,11 +1590,13 @@ class SyncPatch:
             "faults": [dataclasses.asdict(f) for f in self.faults],
             "lines": {k: [s.to_dict() for s in v] for k, v in self.lines.items()},
             "notes": list(self.notes),
+            "removed": {k: [r.to_dict() for r in v] for k, v in self.removed.items()},
+            "diode_blocks": [b.to_dict() for b in self.diode_blocks],
         }
 
     @classmethod
     def from_dict(cls, d: Mapping[str, Any]) -> SyncPatch:
-        if d.get("format_version") != PATCH_FORMAT_VERSION:
+        if d.get("format_version") not in (1, PATCH_FORMAT_VERSION):
             raise ValueError(f"unsupported patch format {d.get('format_version')!r}")
         return cls(
             sync_content_hash=d["sync_content_hash"],
@@ -913,6 +1606,11 @@ class SyncPatch:
             faults=tuple(SyncFault(**f) for f in d["faults"]),
             lines={k: [SpanPatch.from_dict(s) for s in v] for k, v in d["lines"].items()},
             notes=list(d.get("notes", [])),
+            removed={
+                k: [RemovedEdges.from_dict(r) for r in v]
+                for k, v in d.get("removed", {}).items()
+            },
+            diode_blocks=[DiodeBlockPatch.from_dict(b) for b in d.get("diode_blocks", [])],
         )
 
     def to_json(self) -> str:
@@ -934,12 +1632,27 @@ class SyncPatch:
         return cls.from_json(npc_io.from_pathlike(path).read_text())
 
     def summary(self) -> dict[str, dict[str, int]]:
-        """line -> {'reconstructed': n spans, 'unknown': n spans}"""
+        """line -> {'reconstructed': n spans, 'unknown': n spans, 'removed_<reason>': n edges}"""
         out: dict[str, dict[str, int]] = {}
         for line, spans in self.lines.items():
             c = out.setdefault(line, {"reconstructed": 0, "unknown": 0})
             for s in spans:
                 c[s.status] += 1
+        for line, removed in self.removed.items():
+            c = out.setdefault(line, {"reconstructed": 0, "unknown": 0})
+            for r in removed:
+                key = f"removed_{r.reason}"
+                c[key] = c.get(key, 0) + len(r.rising_samples) + len(r.falling_samples)
+        return out
+
+    def diode_summary(self) -> dict[str, int]:
+        """Counts over `diode_blocks`: blocks by status, phantom flicker and glitch edges removed."""
+        out = {"cleaned": 0, "rejected": 0, "not_checked": 0, "phantom_flicker_removed": 0, "glitch_removed": 0}
+        for b in self.diode_blocks:
+            out[b.status] += 1
+        for r in self.removed.get("stim_photodiode", []):
+            n = len(r.rising_samples) + len(r.falling_samples)
+            out[f"{r.reason}_removed"] = out.get(f"{r.reason}_removed", 0) + n
         return out
 
 
@@ -988,15 +1701,24 @@ def build_sync_patch(
     builder: str = "",
     periodic_lines: Sequence[str] | None = None,
 ) -> SyncPatch:
-    """Build a `SyncPatch` for a sync file with invalid intervals.
+    """Build a `SyncPatch` for a sync file: phantom-flicker removal on the photodiode line of
+    every box-1 block with a stim file (any file), and reconstructions inside invalid (replayed)
+    intervals.
 
+    - `stim_photodiode`, every block with a matched stim file and diodeBoxFrameInterval 1: edges
+      aligned with the block's frames (`align_diode_toggles`, with reconstructed vsyncs where the
+      block has replayed spans). If every edge is explained, phantom flicker and glitches are
+      removed (`SyncPatch.removed`) and the block is 'cleaned'; edges that can't be explained
+      make it 'rejected' (nothing removed). `SyncPatch.diode_blocks` records the outcome for every
+      block with a stim file.
     - `vsync_stim`: for each span inside a block with a matched stim file, frames are solved
       per gap from `frameIntervals` (`reconcile_vsyncs`); rising edges are placed at the
       reconstructed falling edge minus the median measured pulse width in the block. Spans in
       blocks without a stim file, or that fail a gate, are 'unknown'. Spans outside every
       block with no recorded vsync edges are reconstructed as 'no_edges'.
-    - `stim_photodiode`: predicted from reconstructed vsyncs (`predict_diode_edges`) where the
-      stim file gives `diodeBoxFrameInterval`; else 'unknown'.
+    - `stim_photodiode` inside spans: box interval 1 in a 'cleaned' block: expected toggles of
+      the frames in the span (`predict_box1_diode_edges`); box interval > 1:
+      `predict_diode_edges`; otherwise, or if a gate fails, 'unknown'.
     - camera lines (`*_cam_exposing`, `*_cam_frame_readout`, or `periodic_lines`): integer-period
       interpolation (`interpolate_periodic_edges`), checked against its gates; 'unknown' if a
       gate fails.
@@ -1008,7 +1730,8 @@ def build_sync_patch(
     Parameters
     ----------
     sync
-        A `SyncDataset` (read with `on_invalid='ignore'` internally, so copies are visible).
+        A `SyncDataset` (read with `on_invalid='ignore'` and no patch internally, so the edges
+        are as recorded).
     stim_blocks
         Stim data per vsync block index (`SyncDataset.vsync_times_in_blocks` order, unpatched).
     builder
@@ -1017,6 +1740,7 @@ def build_sync_patch(
     from npc_sync.sync import SyncDataset  # avoid import cycle
 
     raw = SyncDataset(sync, on_invalid="ignore")
+    raw.patch = None
     invalid = tuple(raw.invalid_intervals)
     import importlib.metadata
 
@@ -1031,8 +1755,6 @@ def build_sync_patch(
         patch.notes.append(
             "file has timebase discontinuities: edges after them are shifted; not corrected by this patch"
         )
-    if not invalid:
-        return patch
     fs = raw.sample_freq
     # in 4 of 6 replays checked, the event at the sample before a copy already carries the
     # copy's state (experiments/sync-patch-manifest/acceptance_local7.log), so every span starts
@@ -1043,19 +1765,55 @@ def build_sync_patch(
     # --- vsync + photodiode ----------------------------------------------------------
     vsync_spans: list[SpanPatch] = []
     diode_spans: list[SpanPatch] = []
-    blocks = raw.vsync_times_in_blocks
-    vr_all = raw.get_rising_edges("vsync_stim", units="seconds")
-    vf_all = raw.get_falling_edges("vsync_stim", units="seconds")
+    has_vsync = "vsync_stim" in labels and raw.get_falling_edges("vsync_stim").size > 0
+    blocks: Sequence[npt.NDArray] = ()
+    if has_vsync:
+        try:
+            blocks = raw.vsync_times_in_blocks
+        except (AssertionError, IndexError, ValueError) as exc:
+            # e.g. unbalanced stim_running edges: no blocks, so nothing to check or reconstruct
+            patch.notes.append(f"vsync blocks could not be computed: {exc!r}")
+    vr_all = raw.get_rising_edges("vsync_stim", units="seconds") if has_vsync else np.array([])
+    vf_all = raw.get_falling_edges("vsync_stim", units="seconds") if has_vsync else np.array([])
     has_diode = "stim_photodiode" in labels
     if has_diode:
-        dr_all = raw.get_rising_edges("stim_photodiode", units="seconds")
-        df_all = raw.get_falling_edges("stim_photodiode", units="seconds")
+        d_rs = np.asarray(raw.get_rising_edges("stim_photodiode", units="samples"), dtype=np.int64)
+        d_fs = np.asarray(raw.get_falling_edges("stim_photodiode", units="samples"), dtype=np.int64)
+        dr_all, df_all = d_rs / fs, d_fs / fs
+        d_samples = np.concatenate([d_rs, d_fs])
+        d_rising = np.concatenate([np.ones(len(d_rs), bool), np.zeros(len(d_fs), bool)])
+        o = np.argsort(d_samples, kind="stable")
+        d_samples, d_rising = d_samples[o], d_rising[o]
+        d_times = d_samples / fs
+        diode_bit = raw._line_to_bit("stim_photodiode")
+    else:
+        dr_all = df_all = np.array([])
     by_block = {sb.block_index: sb for sb in stim_blocks}
     covered: list[tuple[float, float]] = []
+
+    def diode_record(
+        bi: int,
+        block: npt.NDArray,
+        status: DiodeBlockStatus,
+        reason: str = "",
+        sb: StimBlock | None = None,
+        diagnostics: dict[str, Any] | None = None,
+    ) -> None:
+        patch.diode_blocks.append(
+            DiodeBlockPatch(
+                block_index=bi,
+                start=float(block[0]),
+                stop=float(block[-1]),
+                status=status,
+                reason=reason,
+                stim=sb.name if sb else "",
+                diode_box_frame_interval=sb.diode_box_frame_interval if sb else None,
+                diagnostics=_jsonable(diagnostics or {}),
+            )
+        )
+
     for bi, block in enumerate(blocks):
         overlapping = [(a, z) for a, z in spans_base if a <= block[-1] and z > block[0]]
-        if not overlapping:
-            continue
         sb = by_block.get(bi)
         if sb is None:
             for a, z in overlapping:
@@ -1063,71 +1821,129 @@ def build_sync_patch(
                 diode_spans.append(SpanPatch((a, z), "unknown", method="mask", reason=f"block {bi}: no stim file"))
                 covered.append((a, z))
             continue
-        rec = solve_vsync_gaps(block, sb.frame_intervals, overlapping)
-        failures = rec.failures()
-        if failures:
-            for a, z in overlapping:
+        rec: VsyncReconciliation | None = None
+        if overlapping:
+            rec = solve_vsync_gaps(block, sb.frame_intervals, overlapping)
+            failures = rec.failures()
+            if failures:
                 reason = f"block {bi} ({sb.name}): " + "; ".join(failures)
-                vsync_spans.append(SpanPatch((a, z), "unknown", method="mask", reason=reason))
-                diode_spans.append(SpanPatch((a, z), "unknown", method="mask", reason=reason))
-                covered.append((a, z))
-            continue
-        # pulse width from measured edges in the block
-        widths = []
-        in_block_f = vf_all[(vf_all >= block[0]) & (vf_all <= block[-1])]
-        j = np.searchsorted(vr_all, in_block_f) - 1
-        ok = j >= 0
-        widths = in_block_f[ok] - vr_all[j[ok]]
-        widths = widths[~in_intervals(in_block_f[ok], [g.span for g in rec.gaps])]
-        width = float(np.median(widths))
-        for g in rec.gaps:
-            idx = np.arange(g.frame_before + 1, g.frame_before + 1 + g.n_frames)
-            fall = rec.times[idx]
-            vsync_spans.append(
-                SpanPatch(
-                    g.span,
-                    "reconstructed",
-                    rising=fall - width,
-                    falling=fall,
-                    method="frame_intervals",
-                    error_bound_sec=VSYNC_MAX_GAP_RESIDUAL_SEC,
-                    diagnostics={
-                        "block_index": bi,
-                        "stim": sb.name,
-                        "frame_before": g.frame_before,
-                        "n_frames": g.n_frames,
-                        "n_removed": g.n_removed,
-                        "anchor_residual_sec": g.residual_sec,
-                        "second_best_sec": g.second_best_sec,
-                        "pulse_width_sec": width,
-                    },
-                )
-            )
-            covered.append(g.span)
-            if not has_diode:
+                for a, z in overlapping:
+                    vsync_spans.append(SpanPatch((a, z), "unknown", method="mask", reason=reason))
+                    diode_spans.append(SpanPatch((a, z), "unknown", method="mask", reason=reason))
+                    covered.append((a, z))
+                if has_diode:
+                    diode_record(bi, block, "not_checked", "vsyncs not reconstructed: " + "; ".join(failures), sb)
                 continue
-            if sb.diode_box_frame_interval is None:
-                diode_spans.append(SpanPatch(g.span, "unknown", method="mask", reason="diodeBoxFrameInterval unknown"))
-                continue
-            rise, fall_d, sol = predict_diode_edges(
-                rec.times, dr_all, df_all, g.span, sb.diode_box_frame_interval
-            )
-            dfail = sol.failures()
-            diag = _jsonable(dataclasses.asdict(sol))
-            if dfail:
-                diode_spans.append(SpanPatch(g.span, "unknown", method="mask", diagnostics=diag, reason="; ".join(dfail)))
-            else:
-                diode_spans.append(
+            # pulse width from measured edges in the block
+            in_block_f = vf_all[(vf_all >= block[0]) & (vf_all <= block[-1])]
+            j = np.searchsorted(vr_all, in_block_f) - 1
+            ok = j >= 0
+            widths = in_block_f[ok] - vr_all[j[ok]]
+            widths = widths[~in_intervals(in_block_f[ok], [g.span for g in rec.gaps])]
+            width = float(np.median(widths))
+            for g in rec.gaps:
+                idx = np.arange(g.frame_before + 1, g.frame_before + 1 + g.n_frames)
+                fall = rec.times[idx]
+                vsync_spans.append(
                     SpanPatch(
                         g.span,
                         "reconstructed",
-                        rising=rise,
-                        falling=fall_d,
-                        method="vsync+latency",
-                        error_bound_sec=sol.baseline_error_sec + DIODE_MAX_RESIDUAL_ABOVE_BASELINE_SEC,
-                        diagnostics=diag,
+                        rising=fall - width,
+                        falling=fall,
+                        method="frame_intervals",
+                        error_bound_sec=VSYNC_MAX_GAP_RESIDUAL_SEC,
+                        diagnostics={
+                            "block_index": bi,
+                            "stim": sb.name,
+                            "frame_before": g.frame_before,
+                            "n_frames": g.n_frames,
+                            "n_removed": g.n_removed,
+                            "anchor_residual_sec": g.residual_sec,
+                            "second_best_sec": g.second_best_sec,
+                            "pulse_width_sec": width,
+                        },
                     )
                 )
+                covered.append(g.span)
+            frame_times = rec.times
+            frame_measured = rec.source == MEASURED
+        else:
+            if len(block) != len(sb.frame_intervals) + 1:
+                if has_diode:
+                    diode_record(
+                        bi, block, "not_checked",
+                        f"{len(block)} vsyncs, {len(sb.frame_intervals) + 1} stim frames", sb,
+                    )
+                continue
+            frame_times = np.asarray(block, dtype=float)
+            frame_measured = np.ones(len(block), bool)
+        if not has_diode:
+            continue
+        gap_spans = [g.span for g in rec.gaps] if rec is not None else []
+        box = sb.diode_box_frame_interval
+        if box is None:
+            for sp in gap_spans:
+                diode_spans.append(SpanPatch(sp, "unknown", method="mask", reason="diodeBoxFrameInterval unknown"))
+            diode_record(bi, block, "not_checked", "diodeBoxFrameInterval unknown", sb)
+            continue
+        if box != 1:
+            for sp in gap_spans:
+                others = [x for x in spans_base if not (x[0] >= sp[0] - 1e-9 and x[1] <= sp[1] + 1e-9)]
+                rise, fall_d, sol = predict_diode_edges(frame_times, dr_all, df_all, sp, box, exclude=others)
+                _append_diode_span(diode_spans, sp, rise, fall_d, sol, method="vsync+latency")
+            diode_record(
+                bi, block, "not_checked",
+                f"phantom flicker removal applies to diodeBoxFrameInterval 1 (this block: {box})", sb,
+            )
+            continue
+        # box interval 1: align every measured edge with the block's frames
+        d_spans = [_extend_span_over_splice(raw, diode_bit, sp) for sp in gap_spans]
+        in_win = (d_times >= block[0]) & (d_times < block[-1] + DIODE_BLOCK_END_PADDING_SEC)
+        sel = np.flatnonzero(in_win & ~in_intervals(d_times, d_spans))
+        jr = np.searchsorted(vr_all, frame_times) - 1
+        frame_rise = np.where(frame_measured & (jr >= 0), vr_all[np.clip(jr, 0, None)], np.nan)
+        try:
+            al = align_diode_toggles(
+                frame_times,
+                sb.frame_intervals,
+                d_times[sel],
+                d_rising[sel],
+                frame_signal_rising=frame_rise,
+                unobserved=d_spans,
+            )
+        except DiodeOffsetUndetermined as exc:
+            for sp in d_spans:
+                diode_spans.append(SpanPatch(sp, "unknown", method="mask", reason=f"diodeBoxFrameInterval 1: {exc}"))
+            diode_record(bi, block, "not_checked", f"frame <-> diode edge offset undetermined: {exc}", sb)
+            continue
+        diag = al.summary()
+        fails = al.failures()
+        if fails:
+            reason = "; ".join(fails)
+            for sp in d_spans:
+                diode_spans.append(
+                    SpanPatch(sp, "unknown", method="mask", diagnostics=diag, reason=f"diode edges not explained: {reason}")
+                )
+            diode_record(bi, block, "rejected", reason, sb, diag)
+            continue
+        for cls_value, reason in ((DIODE_PHANTOM_FLICKER, "phantom_flicker"), (DIODE_GLITCH, "glitch")):
+            idx = sel[np.flatnonzero(al.edge_class == cls_value)]
+            if len(idx):
+                patch.removed.setdefault("stim_photodiode", []).append(
+                    RemovedEdges(
+                        reason=reason,
+                        block_index=bi,
+                        rising_samples=d_samples[idx[d_rising[idx]]],
+                        falling_samples=d_samples[idx[~d_rising[idx]]],
+                    )
+                )
+        diode_record(bi, block, "cleaned", "", sb, diag)
+        for sp in d_spans:
+            n_in = int(in_intervals(d_times, [sp]).sum())
+            rise, fall_d, sol = predict_box1_diode_edges(al, sp, n_removed=n_in)
+            _append_diode_span(diode_spans, sp, rise, fall_d, sol, method="vsync+latency (box 1 alignment)")
+    if not invalid:
+        return patch
     # invalid intervals not overlapping any block: vsync + diode reconstructed as 'no edges'
     # if nothing was recorded there, else unknown
     for a, z in spans_base:
@@ -1221,6 +2037,44 @@ def build_sync_patch(
         ]
     _extend_unknown_spans_over_splice(raw, patch)
     return patch
+
+
+def _append_diode_span(
+    spans: list[SpanPatch],
+    span: tuple[float, float],
+    rising: npt.NDArray,
+    falling: npt.NDArray,
+    sol: DiodeSpanSolution,
+    method: str,
+) -> None:
+    fails = sol.failures()
+    diag = _jsonable(dataclasses.asdict(sol))
+    if fails:
+        spans.append(SpanPatch(span, "unknown", method="mask", diagnostics=diag, reason="; ".join(fails)))
+    else:
+        spans.append(
+            SpanPatch(
+                span,
+                "reconstructed",
+                rising=rising,
+                falling=falling,
+                method=method,
+                error_bound_sec=sol.baseline_error_sec + DIODE_MAX_RESIDUAL_ABOVE_BASELINE_SEC,
+                diagnostics=diag,
+            )
+        )
+
+
+def _extend_span_over_splice(raw: Any, bit: int, span: tuple[float, float]) -> tuple[float, float]:
+    """The first event after a copy is compared with the copy's last state, so a change of `bit`
+    there may be a splice artefact rather than a real edge: include that event in the span."""
+    times = np.asarray(raw.get_all_times("samples"), dtype=np.int64)
+    bits = np.asarray(raw.get_all_bits(), dtype=np.int64)
+    fs = raw.sample_freq
+    j = int(np.searchsorted(times, span[1] * fs - 1e-6))
+    if 0 < j < len(times) and ((bits[j] >> bit) & 1) != ((bits[j - 1] >> bit) & 1):
+        return (span[0], (times[j] + 1) / fs)
+    return span
 
 
 def _extend_unknown_spans_over_splice(raw: Any, patch: SyncPatch) -> None:
