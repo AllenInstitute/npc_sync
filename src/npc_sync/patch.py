@@ -848,12 +848,18 @@ HELD_FRAME_MIN_REFRESHES = 1.5
 """A stim frame interval at least this many refreshes long is a held (dropped) frame."""
 DIODE_OFF_GRID_FRACTION = 0.1
 """A stim frame interval more than this fraction of a refresh from a whole number of refreshes is
-off the refresh grid: a late `flip()` return at one of its ends (the frame-signal falling edge
-and PsychoPy's frame interval are late; the frame was displayed on time)."""
+off the refresh grid: the frame-signal falling edge at one of its ends came late, and the frame
+was displayed on time (99.4% of 23,281 isolated late falling edges, TTL and NI-DAQ AI0:
+npc_sessions experiments/phantom-flicker/late_return_check.log). TaskControl writes that edge
+right after `flip()` returns, so the delay is somewhere between the buffer swap and the write.
+Only about a quarter of late falling edges reach PsychoPy's frame interval (the delay came
+before its frame timestamp); in the rest the stim interval is regular and only the sync line is
+off the grid, so they aren't flagged here."""
 DIODE_LANDMARK_LATENCY_RANGE_SEC = (0.005, 0.035)
 """Latency accepted for a landmark. Block medians: rising 19.5-20.4 ms, falling 23.4-25.9 ms
-(survey_blocks.csv); one refresh more (>= 36 ms) is excluded: a late `flip()` return produces that
-alias (stim interval k long, diode interval k+1 long)."""
+(survey_blocks.csv); one refresh more (>= 36 ms) is excluded: a late falling edge before a held
+frame produces that alias (stim interval k long, diode interval k+1 long: 339 frames in
+late_return_check)."""
 DIODE_LANDMARK_LENGTH_TOL_REFRESHES = 0.5
 DIODE_MIN_LANDMARKS = 3
 DIODE_MIN_LANDMARK_AGREEMENT = 0.9
@@ -911,7 +917,8 @@ class DiodeToggleAlignment:
     unobserved: npt.NDArray[np.bool_]
     """Per frame: unmatched, with the expected toggle in or next to an `unobserved` interval."""
     second_pass: npt.NDArray[np.intp]
-    """Frames matched only in the second pass (late `flip()` return)."""
+    """Frames matched only in the second pass (late frame-signal falling edge; the frame was
+    displayed on time)."""
     refresh_sec: float
     n_refreshes: npt.NDArray[np.int_]
     """round(frameIntervals / refresh) per frame interval."""
@@ -920,8 +927,10 @@ class DiodeToggleAlignment:
     long_interval_mismatch: dict[str, npt.NDArray[np.intp]]
     """Long-interval check: frame intervals k where stim (>= 1.5 refreshes) and diode
     (latency-corrected toggle-to-toggle interval >= 1.5 refreshes) disagree, by cause:
-    'late_return' (stim interval k or a neighbour off the refresh grid), 'after_stall' (toggle k
-    or k+1 off its expected time by > `DIODE_AFTER_STALL_RESIDUAL_SEC`), 'other'."""
+    'late_return' (stim interval k or a neighbour off the refresh grid, i.e. a late frame-signal
+    falling edge: a rule, not checked case by case; the key name is kept for compatibility),
+    'after_stall' (toggle k or k+1 off its expected time by > `DIODE_AFTER_STALL_RESIDUAL_SEC`),
+    'other'."""
 
     def count(self, edge_class: int) -> int:
         return int((self.edge_class == edge_class).sum())
@@ -1216,7 +1225,8 @@ def align_diode_toggles(
     3. Per-polarity latency, piecewise constant between held frames (it can switch at a stall).
     4. Each frame's toggle: the edge of its polarity nearest its expected time, within
        `DIODE_TOGGLE_MATCH_TOL_SEC`; frames left unmatched get a second pass down to their
-       frame-signal rising edge + `DIODE_MIN_DISPLAY_AFTER_RISE_SEC` (late `flip()` return).
+       frame-signal rising edge + `DIODE_MIN_DISPLAY_AFTER_RISE_SEC` (a late frame-signal
+       falling edge: the frame is displayed on time, see `DIODE_OFF_GRID_FRACTION`).
     5. Edges between the toggles of frames k and k+1 are phantom flicker if frame k is held for
        n >= 3 refreshes and they are an even number <= n - 1; otherwise unexplained.
     6. Long-interval check (`DiodeToggleAlignment.long_interval_mismatch`).
@@ -1383,8 +1393,13 @@ def predict_box1_diode_edges(
     glitches count as polarity errors, as do missing toggles), and the toggles in the
     `DIODE_CHECK_WINDOW_SEC` after the span are as close to their expected times as those in
     `window_sec` before it (+ `DIODE_MAX_RESIDUAL_ABOVE_BASELINE_SEC`). The first toggle after a
-    held frame and late `flip()` returns are left out of both, since their TTL timing deviates
-    for reasons the prediction can't model.
+    held frame, and toggles matched in the second pass (late falling edges), are left out of
+    both, since the prediction (frame time + latency) doesn't hold for them.
+
+    Limitation: inside the span, frame times come from the stim's `frameIntervals`. A frame
+    whose late falling edge reached PsychoPy's frame interval (about 1 interval in 5,000 is off
+    the refresh grid there) gets a predicted edge late by that delay, although it was displayed
+    on time. Not corrected; the checks after the span can't see it.
     """
     al = alignment
     a, z = span
