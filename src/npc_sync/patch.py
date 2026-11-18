@@ -60,6 +60,9 @@ PERIODIC_MAX_RESIDUAL_SEC = 0.1e-3
 """Max residual of integer-period interpolation across a gap (camera lines)."""
 PERIODIC_MAX_FRACTION = 0.01
 """Max |gap / period - round(gap / period)| for integer-period interpolation."""
+PWM_WIDTH_TOLERANCE_SEC = 0.25e-3
+"""Leading pulses whose width differs from the line's median by more than this are the camera's
+startup PWM section (signature) and are excluded from period fits."""
 PERIODIC_FIT_WINDOW_SEC = 10.0
 """Seconds of measured edges on each side used to fit the period."""
 DIODE_MAX_RESIDUAL_ABOVE_BASELINE_SEC = 0.5e-3
@@ -475,11 +478,52 @@ class PeriodicGapSolution:
         return out
 
 
+def startup_pwm_section(
+    rising: npt.ArrayLike,
+    falling: npt.ArrayLike,
+    tolerance_sec: float = PWM_WIDTH_TOLERANCE_SEC,
+) -> tuple[tuple[float, float], ...]:
+    """Time range of the run of pulses at the start of a line whose width differs from the
+    line's median width, or () if the first pulse has the median width.
+
+    Cameras start with a short run of exposures of a distinctive width (MVR's startup
+    signature, e.g. 10 x 2 ms then 16 ms on an eye camera in DRpilot_857681_20260720; npc_mvr
+    `signature_exposure_duration`). Their period is regular but their falling edges are offset
+    from the rest, so they must not be used to fit the falling-edge period. Only the leading run
+    counts: readout-line widths vary throughout a recording.
+
+    >>> r = np.arange(30) / 60
+    >>> f = r + np.r_[np.full(10, 0.002), np.full(20, 0.016)]
+    >>> [(round(a, 3), round(z, 3)) for a, z in startup_pwm_section(r, f)]
+    [(0.0, 0.152)]
+    >>> startup_pwm_section(r, r + 0.016)
+    ()
+    """
+    r = np.sort(np.asarray(rising, dtype=float))
+    f = np.sort(np.asarray(falling, dtype=float))
+    if len(r) < 2 or len(f) < 2:
+        return ()
+    j = np.searchsorted(f, r)  # first falling edge after each rising edge
+    next_r = np.r_[r[1:], np.inf]
+    ok = j < len(f)
+    ok[ok] &= f[j[ok]] < next_r[ok]  # a complete pulse (not paired across a gap)
+    ok[ok] &= f[j[ok]] - r[ok] < np.median(np.diff(r))  # nor with a pulse whose rise is missing
+    if not ok[0]:
+        return ()
+    r, fall = r[ok], f[j[ok]]
+    odd = np.abs((fall - r) - np.median(fall - r)) > tolerance_sec
+    if not odd[0]:
+        return ()
+    n = int(np.argmin(odd)) if not odd.all() else len(odd)
+    return ((float(r[0]), float(fall[n - 1])),)
+
+
 def interpolate_periodic_edges(
     edges: npt.ArrayLike,
     span: tuple[float, float],
     window_sec: float = PERIODIC_FIT_WINDOW_SEC,
     min_edges_per_side: int = 10,
+    fit_exclude: Iterable[tuple[float, float]] = (),
 ) -> tuple[npt.NDArray[np.float64], PeriodicGapSolution]:
     """Fill a span on a line with a fixed hardware period (camera exposures) by integer-period
     interpolation between the measured edges on either side.
@@ -511,6 +555,10 @@ def interpolate_periodic_edges(
     inside = in_intervals(e, [span])
     n_removed = int(inside.sum())
     kept = e[~inside]
+    # edges excluded from the fit (a camera's startup PWM section; see
+    # `startup_pwm_section`) stay in the data but aren't used as anchors or for the period.
+    # If they're next to the span, the "stops or starts near the span" check fails.
+    kept = kept[~in_intervals(kept, [(x - 1e-9, y + 1e-9) for x, y in fit_exclude])]
     before = kept[(kept < a) & (kept >= a - window_sec)]
     after = kept[(kept >= z) & (kept < z + window_sec)]
     if before.size == 0 and after.size == 0:
@@ -1108,11 +1156,15 @@ def build_sync_patch(
         spans = []
         rising = raw.get_rising_edges(line, units="seconds")
         falling = raw.get_falling_edges(line, units="seconds")
+        clean_r = rising[~in_intervals(rising, spans_base)]
+        clean_f = falling[~in_intervals(falling, spans_base)]
+        pwm = startup_pwm_section(clean_r, clean_f)
         for a, z in spans_base:
-            new_r, sol_r = interpolate_periodic_edges(rising, (a, z))
-            new_f, sol_f = interpolate_periodic_edges(falling, (a, z))
+            new_r, sol_r = interpolate_periodic_edges(rising, (a, z), fit_exclude=pwm)
+            new_f, sol_f = interpolate_periodic_edges(falling, (a, z), fit_exclude=pwm)
             fails = sol_r.failures() + sol_f.failures()
-            diag = {"rising": dataclasses.asdict(sol_r), "falling": dataclasses.asdict(sol_f)}
+            diag = {"rising": dataclasses.asdict(sol_r), "falling": dataclasses.asdict(sol_f),
+                    "pwm_sections_excluded_from_fit": [list(x) for x in pwm]}
             if not fails and sol_r.status == "inactive" and sol_f.status == "inactive":
                 spans.append(SpanPatch((a, z), "reconstructed", method="no_edges", diagnostics=diag, reason="line inactive"))
             elif fails or sol_r.status != sol_f.status:

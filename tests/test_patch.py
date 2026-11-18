@@ -272,3 +272,23 @@ def test_patch_applies_to_a_view_of_a_raw_dataset(replayed) -> None:
     # the builder sees the recorded edges even if given a patched dataset
     again = P.build_sync_patch(patched, [P.StimBlock(0, replayed["fi"], 3)], builder="test")
     assert again.to_dict()["lines"] == patch.to_dict()["lines"]
+
+
+def test_camera_startup_pwm_section_is_excluded_from_the_fit() -> None:
+    """DRpilot_857681_20260720 eye camera: 10 x 2 ms exposures at startup, then 16 ms, inside
+    the 10 s fit window before a replayed span. Falling edges of the PWM section are 14 ms
+    early relative to the rest and skewed the period fit (gate failed, -0.146 ms)."""
+    p = 1 / 60.02
+    rising = 12.0 + np.arange(1200) * p
+    width = np.r_[np.full(10, 0.002), np.full(1190, 0.016)]
+    falling = rising + width
+    span = (20.5, 22.0)
+    rec_r, rec_f = rising[~P.in_intervals(rising, [span])], falling[~P.in_intervals(falling, [span])]
+    pwm = P.startup_pwm_section(rec_r, rec_f)
+    assert len(pwm) == 1 and pwm[0][0] == pytest.approx(12.0)
+    _, old = P.interpolate_periodic_edges(rec_f, span)
+    assert old.failures()  # the PWM section skews the fit
+    new, sol = P.interpolate_periodic_edges(rec_f, span, fit_exclude=pwm)
+    assert not sol.failures()
+    truth = falling[P.in_intervals(falling, [span])]
+    assert len(new) == len(truth) and np.max(np.abs(new - truth)) < 1e-6
