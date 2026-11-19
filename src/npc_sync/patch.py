@@ -17,7 +17,7 @@ checked independently of `SyncDataset`. The builder that combines them is `build
 
 Gates (npc_sessions `outputs/sync-frame-timing-upgrade-plan.md`, re-derived from the P0
 manifest): per-gap vsync residual <= 0.2 ms with the second-best frame count >= 10 ms worse and
-an exact block balance; camera residual <= 0.1 ms with |gap / period - n| <= 0.01; predicted
+an exact block balance; camera residual <= 2 ms with |gap / period - n| <= 0.1; predicted
 photodiode edges in the 0.5 s after a span within the pre-span error + 0.5 ms.
 """
 
@@ -58,10 +58,17 @@ unexplained ~0.4 ms-per-buffer residual of multi-run files, so the gate sits bet
 modes (was 0.5 ms, which admitted it)."""
 VSYNC_MIN_SECOND_BEST_MARGIN_SEC = 10e-3
 """The second-best frame count for a gap must be at least this much worse than the best."""
-PERIODIC_MAX_RESIDUAL_SEC = 0.1e-3
-"""Max residual of integer-period interpolation across a gap (camera lines)."""
-PERIODIC_MAX_FRACTION = 0.01
-"""Max |gap / period - round(gap / period)| for integer-period interpolation."""
+PERIODIC_MAX_RESIDUAL_SEC = 2e-3
+"""Max residual of integer-period interpolation across a gap (camera lines).
+
+The inserted edges are spaced evenly between the measured anchors, so the residual is spread
+over the gap and each inserted edge is off by at most ~|residual|. That is what matters for
+camera frame times (period ~16.7 ms), not where the residual distribution sits: it was 0.1 ms
+(between-modes gate), which masked 193 of 9,692 camera line x span x edge cases (max
+1.24 ms, all with |gap / period - n| <= 0.075) whose frame count was not in doubt."""
+PERIODIC_MAX_FRACTION = 0.1
+"""Max |gap / period - round(gap / period)| for integer-period interpolation. Guards the frame
+count: a dropped or extra frame gives ~1 (all observed cases <= 0.075); was 0.01."""
 PWM_WIDTH_TOLERANCE_SEC = 0.25e-3
 """Leading pulses whose width differs from the line's median by more than this are the camera's
 startup PWM section (signature) and are excluded from period fits."""
@@ -2266,7 +2273,9 @@ def build_sync_patch(
                         rising=new_r,
                         falling=new_f,
                         method="periodic",
-                        error_bound_sec=PERIODIC_MAX_RESIDUAL_SEC,
+                        error_bound_sec=max(
+                            abs(s.residual_sec or 0.0) for s in (sol_r, sol_f)
+                        ),
                         diagnostics=diag,
                     )
                 )
