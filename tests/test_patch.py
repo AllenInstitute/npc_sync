@@ -302,3 +302,21 @@ def test_camera_startup_pwm_section_is_excluded_from_the_fit() -> None:
     assert not sol.failures()
     truth = falling[P.in_intervals(falling, [span])]
     assert len(new) == len(truth) and np.max(np.abs(new - truth)) < 1e-6
+
+
+def test_plain_file_gate_admits_sub_ms_residual(replayed) -> None:
+    """A 0.5 ms residual in one gap passes the 1 ms gate of files with no discontinuity and
+    few replays, but not the 0.2 ms gate (fails under <= 0.3.6, which rejected the block)."""
+    raw = npc_sync.SyncDataset(replayed["path"], on_invalid="ignore")
+    (block,) = raw.vsync_times_in_blocks
+    fi = replayed["fi"].copy()
+    a, z = raw.invalid_intervals[0]
+    inside = np.flatnonzero((replayed["frames"][:-1] > a) & (replayed["frames"][:-1] < z))
+    fi[inside[len(inside) // 2]] += 0.5e-3
+    rec = P.solve_vsync_gaps(block, fi, raw.invalid_intervals)
+    assert 0.2e-3 < abs(rec.gaps[0].residual_sec) <= 1e-3
+    assert rec.failures()  # strict default gate
+    assert not rec.failures(P.VSYNC_MAX_GAP_RESIDUAL_PLAIN_SEC)
+    patch = P.build_sync_patch(raw, [P.StimBlock(0, fi, 3, "synthetic")], builder="test")
+    assert all(sp.status != "unknown" for sp in patch.lines["vsync_stim"])
+    assert patch.lines["vsync_stim"]

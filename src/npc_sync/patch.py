@@ -56,6 +56,15 @@ Re-derived from the P0 manifest (npc_sessions experiments/sync-patch-manifest/su
 at 0.2-0.45 ms (16 gaps, 7 sessions) plus failures > 0.5 ms. That cluster matches the
 unexplained ~0.4 ms-per-buffer residual of multi-run files, so the gate sits between the
 modes (was 0.5 ms, which admitted it)."""
+VSYNC_MAX_GAP_RESIDUAL_PLAIN_SEC = 1e-3
+"""Residual gate for a file with no timebase discontinuity and fewer than
+`VSYNC_PLAIN_MAX_REPLAYS` replayed intervals. Their 0.2-0.9 ms residuals come in +/- pairs
+within a block, and the replayed frames match the NI-DAQ analog photodiode to <= 0.44 ms
+(798632_2025-08-29: npc_sessions experiments/sync-patch-manifest/widened_compare.log), no
+worse than the jitter before the span. The second-best frame-count margin still applies.
+Files with discontinuities or many replays keep `VSYNC_MAX_GAP_RESIDUAL_SEC`: their residual
+grows with span length (about -0.55 ms per second) for an unexplained reason."""
+VSYNC_PLAIN_MAX_REPLAYS = 20
 VSYNC_MIN_SECOND_BEST_MARGIN_SEC = 10e-3
 """The second-best frame count for a gap must be at least this much worse than the best."""
 PERIODIC_MAX_RESIDUAL_SEC = 2e-3
@@ -2008,7 +2017,15 @@ def build_sync_patch(
         rec: VsyncReconciliation | None = None
         if overlapping:
             rec = solve_vsync_gaps(block, sb.frame_intervals, overlapping)
-            failures = rec.failures()
+            plain = (
+                not raw.timebase_discontinuities
+                and len(invalid) < VSYNC_PLAIN_MAX_REPLAYS
+            )
+            failures = rec.failures(
+                VSYNC_MAX_GAP_RESIDUAL_PLAIN_SEC
+                if plain
+                else VSYNC_MAX_GAP_RESIDUAL_SEC
+            )
             if failures:
                 reason = f"block {bi} ({sb.name}): " + "; ".join(failures)
                 for a, z in overlapping:
