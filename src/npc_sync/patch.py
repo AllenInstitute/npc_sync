@@ -1843,6 +1843,11 @@ def line_key(line_labels: Sequence[str], bit: int) -> str:
 
 
 CAMERA_LINE_SUFFIXES = ("_cam_exposing", "_cam_frame_readout")
+PERIODIC_LINE_SUFFIXES = ("_cam_exposing",)
+"""Lines interpolated by `build_sync_patch` by default. Readout lines are not periodic: the
+readout delay after exposure switches between levels (e.g. 0.05 / 3.3 ms) and pulses can be
+missing (npc_sessions experiments/camera-frame-regularity), so they are 'unknown' inside spans.
+npc_mvr uses them only for a QC count, not frame times."""
 
 
 def build_sync_patch(
@@ -1869,9 +1874,9 @@ def build_sync_patch(
     - `stim_photodiode` inside spans: box interval 1 in a 'cleaned' block: expected toggles of
       the frames in the span (`predict_box1_diode_edges`); box interval > 1:
       `predict_diode_edges`; otherwise, or if a gate fails, 'unknown'.
-    - camera lines (`*_cam_exposing`, `*_cam_frame_readout`, or `periodic_lines`): integer-period
+    - camera exposing lines (`*_cam_exposing`, or `periodic_lines`): integer-period
       interpolation (`interpolate_periodic_edges`), checked against its gates; 'unknown' if a
-      gate fails.
+      gate fails. Camera readout lines are 'unknown' (see `PERIODIC_LINE_SUFFIXES`).
     - `stim_running`: 'no_edges' if no edges were recorded in the span and the level is the
       same on both sides (assumes no stimulus started and stopped within the span); else
       'unknown'.
@@ -2227,7 +2232,7 @@ def build_sync_patch(
     periodic = (
         list(periodic_lines)
         if periodic_lines is not None
-        else [lab for lab in labels if lab.endswith(CAMERA_LINE_SUFFIXES)]
+        else [lab for lab in labels if lab.endswith(PERIODIC_LINE_SUFFIXES)]
     )
     for line in periodic:
         spans = []

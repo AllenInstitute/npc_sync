@@ -22,6 +22,7 @@ LABELS[2] = "vsync_stim"
 LABELS[4] = "stim_photodiode"
 LABELS[5] = "stim_running"
 LABELS[27] = "beh_cam_exposing"
+LABELS[28] = "beh_cam_frame_readout"
 LABELS[31] = "lick_sensor"
 
 
@@ -42,6 +43,7 @@ def _truth(seed: int = 0, duration: float = 60.0, stim_start: float = 5.0, n_fra
     cam = np.arange(1.0, duration - 1, 1 / 60.02)
     for t in cam:
         edges[27] += [(t, 1), (t + 0.003, 0)]
+        edges[28] += [(t + 0.004, 1), (t + 0.006, 0)]
     licks = np.sort(rng.uniform(stim_start, frames[-1], 150))
     licks = licks[np.r_[True, np.diff(licks) > 0.1]]
     for t in licks:
@@ -188,6 +190,12 @@ def test_patch_applies(replayed) -> None:
     # camera: integer-period interpolation
     cam = s.get_rising_edges("beh_cam_exposing", units="seconds")
     assert len(cam) == len(replayed["cam"]) and np.max(np.abs(cam - replayed["cam"])) < 2 / FS
+    # camera readout: not periodic in real files, so unknown inside the intervals (no raise)
+    assert all(sp.status == "unknown" for sp in patch.lines["beh_cam_frame_readout"])
+    ro = s.get_rising_edges("beh_cam_frame_readout", units="seconds")
+    unknown_ro = s.get_unknown_intervals("beh_cam_frame_readout")
+    truth_ro = replayed["cam"] + 0.004
+    assert np.allclose(ro, truth_ro[~P.in_intervals(truth_ro, unknown_ro)], atol=1 / FS)
     # photodiode: predicted edges match the truth
     d = np.sort(
         np.r_[
