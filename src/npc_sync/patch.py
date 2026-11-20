@@ -1988,10 +1988,16 @@ def build_sync_patch(
     builder: str = "",
     periodic_lines: Sequence[str] | None = None,
 ) -> SyncPatch:
-    """Build a `SyncPatch` for a sync file: its timebase (`SyncDataset.find_timebase`:
-    dropped and replayed acquisition buffers), phantom-flicker removal on the photodiode line
-    of every box-1 block with a stim file (any file), and reconstructions inside the invalid
-    intervals of that timebase (true time that no recorded buffer holds).
+    """Build a `SyncPatch` for a sync file: phantom-flicker removal on the photodiode line of
+    every box-1 block with a stim file (any file), and reconstructions inside its invalid
+    intervals.
+
+    Pass a dataset on the file's timebase, `SyncDataset(sync, on_invalid='ignore',
+    timebase=sync.find_timebase())`, to correct dropped acquisition buffers: the patch then
+    carries the timebase, and the invalid intervals are the stretches of true time that no
+    recorded buffer holds. With a dataset without a timebase, samples are used as recorded
+    and the invalid intervals are the replayed copies (the behaviour up to 0.3.7: data
+    recorded between a dropped buffer and the copies that make up for it stays displaced).
 
     - `stim_photodiode`, every block with a matched stim file and diodeBoxFrameInterval 1: edges
       aligned with the block's frames (`align_diode_toggles`, with reconstructed vsyncs where the
@@ -2019,11 +2025,10 @@ def build_sync_patch(
     ----------
     sync
         A `SyncDataset` (read with `on_invalid='ignore'` and no patch internally, so the edges
-        are as measured). Its `timebase` is used if it has one, else `find_timebase()`.
+        are as measured), on the timebase the patch should use.
     stim_blocks
-        Stim data per vsync block index: `SyncDataset.vsync_times_in_blocks` order of an
-        unpatched view on the same timebase, i.e.
-        `SyncDataset(sync, on_invalid='ignore', timebase=sync.find_timebase())`.
+        Stim data per vsync block index: `SyncDataset.vsync_times_in_blocks` order of
+        `SyncDataset(sync, on_invalid='ignore')` (unpatched, same timebase).
     builder
         Identifier of the calling builder (recorded in the patch), e.g. 'npc_sessions 0.0.292'.
     """
@@ -2031,10 +2036,6 @@ def build_sync_patch(
 
     source = SyncDataset(sync, on_invalid="ignore")
     timebase = source.timebase
-    if timebase is None and source.meta_data["ni_daq"]["counter_bits"] == 32:
-        timebase = source.find_timebase()
-    if timebase is not None and timebase.is_identity:
-        timebase = None
     raw = SyncDataset(
         source, on_invalid="ignore", timebase=timebase if timebase else False
     )

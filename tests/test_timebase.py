@@ -201,7 +201,7 @@ def test_patch_reconstructs_dropped_data(dropped, truth) -> None:
     view = npc_sync.SyncDataset(raw, on_invalid="ignore", timebase=tb)
     assert len(view.vsync_times_in_blocks) == 1
     patch = P.build_sync_patch(
-        raw, [P.StimBlock(0, truth["fi"], 3, "synthetic")], builder="test"
+        view, [P.StimBlock(0, truth["fi"], 3, "synthetic")], builder="test"
     )
     assert patch.timebase == tb
     assert [f.kind for f in patch.faults] == ["drop", "drop"]
@@ -253,8 +253,9 @@ def test_displaced_data_before_replayed_run(displaced, truth) -> None:
         (67 * BUFFER, 68 * BUFFER),
         (140 * BUFFER, 143 * BUFFER),
     )
+    view = npc_sync.SyncDataset(raw, on_invalid="ignore", timebase=tb)
     patch = P.build_sync_patch(
-        raw, [P.StimBlock(0, truth["fi"], 3, "synthetic")], builder="test"
+        view, [P.StimBlock(0, truth["fi"], 3, "synthetic")], builder="test"
     )
     s = npc_sync.SyncDataset(displaced, patch=patch)
     assert s.invalid_intervals == ((30.0, 30.5), (33.5, 34.0), (70.0, 71.5))
@@ -335,3 +336,19 @@ def test_late_frame_signal_edge_at_a_gap_anchor(truth) -> None:
     off = v.copy()
     off[j:] += 0.004
     assert abs(P.solve_vsync_gaps(off, fi, [span]).gaps[0].residual_sec) > 3.9e-3
+
+
+def test_patch_without_timebase_is_on_the_recorded_clock(displaced, truth) -> None:
+    """A dataset without a timebase gives the patch of <= 0.3.7: copies are the invalid
+    intervals, nothing is moved."""
+    raw = npc_sync.SyncDataset(displaced, on_invalid="ignore")
+    patch = P.build_sync_patch(
+        raw, [P.StimBlock(0, truth["fi"], 3, "synthetic")], builder="test"
+    )
+    assert patch.timebase is None
+    assert patch.invalid_intervals == ((36.0, 37.0), (70.0, 71.5))
+    kinds = [f.kind for f in patch.faults]
+    assert kinds[:2] == ["replay", "replay"]
+    # the barcode recorded between the drops and their copies is 1 s early
+    assert set(kinds[2:]) == {"timebase_discontinuity"}
+    assert npc_sync.SyncDataset(displaced, patch=patch).timebase is None
