@@ -58,16 +58,27 @@ Re-derived from the P0 manifest (npc_sessions experiments/sync-patch-manifest/su
 2,971 sync files): in files with < 20 invalid intervals and no timebase discontinuity, 159 of
 183 gaps are <= 0.1 ms (144 <= 0.05 ms), one is 0.13 ms, and the rest form a separate cluster
 at 0.2-0.45 ms (16 gaps, 7 sessions) plus failures > 0.5 ms. That cluster matches the
-unexplained ~0.4 ms-per-buffer residual of multi-run files, so the gate sits between the
-modes (was 0.5 ms, which admitted it)."""
+~0.4 ms-per-buffer residual of multi-run files, so the gate sits between the modes (was
+0.5 ms, which admitted it).
+
+That residual is now explained: an anchor recorded between a dropped buffer and the replayed
+run that makes up for it is displaced by a whole buffer, which is 30 display refreshes minus
+0.42 ms (`npc_sync.timebase`). This gate applies where that can still happen: files whose
+drops couldn't all be located on periodic lines and that have many replayed intervals or a
+remaining discontinuity (see `VSYNC_MAX_GAP_RESIDUAL_PLAIN_SEC`)."""
 VSYNC_MAX_GAP_RESIDUAL_PLAIN_SEC = 1e-3
-"""Residual gate for a file with no timebase discontinuity and fewer than
-`VSYNC_PLAIN_MAX_REPLAYS` replayed intervals. Their 0.2-0.9 ms residuals come in +/- pairs
-within a block, and the replayed frames match the NI-DAQ analog photodiode to <= 0.44 ms
-(798632_2025-08-29: npc_sessions experiments/sync-patch-manifest/widened_compare.log), no
-worse than the jitter before the span. The second-best frame-count margin still applies.
-Files with discontinuities or many replays keep `VSYNC_MAX_GAP_RESIDUAL_SEC`: their residual
-grows with span length (about -0.55 ms per second) for an unexplained reason."""
+"""Residual gate for a file with no remaining timebase discontinuity and either every
+dropped buffer located on periodic lines (`Timebase.has_assumed_drops` False), or fewer than
+`VSYNC_PLAIN_MAX_REPLAYS` invalid intervals.
+
+On located timebases the residual is the vsync jitter at the two anchors: 1,144 gaps in 154
+files, median 0.024 ms, p99 0.23 ms, 14 above 0.2 ms and 2 above 1 ms, one of them a late
+frame-signal edge at an anchor, now handled in `solve_vsync_gaps` (npc_sessions
+experiments/sync-timebase-drops/vsync_gap_summary.log). Before drops were located, the
+0.2-0.9 ms residuals of files with few replays came in +/- pairs within a block, and the
+replayed frames matched the NI-DAQ analog photodiode to <= 0.44 ms (798632_2025-08-29:
+npc_sessions experiments/sync-patch-manifest/widened_compare.log). The second-best
+frame-count margin still applies."""
 VSYNC_PLAIN_MAX_REPLAYS = 20
 VSYNC_MIN_SECOND_BEST_MARGIN_SEC = 10e-3
 """The second-best frame count for a gap must be at least this much worse than the best."""
@@ -254,6 +265,15 @@ class VsyncReconciliation:
         return max((abs(g.residual_sec) for g in self.gaps), default=0.0)
 
 
+LATE_ANCHOR_MIN_SEC = 0.5e-3
+"""A gap residual larger than this is checked for a late frame-signal falling edge at one of
+the gap's anchors."""
+
+LATE_ANCHOR_TOLERANCE_SEC = 0.3e-3
+"""... which it is if the measured interval on the far side of that anchor differs from the
+stim's by the residual, within this."""
+
+
 def solve_vsync_gaps(
     vsyncs: npt.ArrayLike,
     frame_intervals: npt.ArrayLike,
@@ -262,6 +282,13 @@ def solve_vsync_gaps(
     """Match a block of recorded vsync times to its stim frames across invalid intervals,
     solving each gap's frame count separately. Does not apply gates: see
     `VsyncReconciliation.failures` and `reconcile_vsyncs`.
+
+    A measured vsync next to a gap can be a late frame-signal falling edge (the frame is
+    displayed on time; the edge is late by a few ms and the next interval short by as much:
+    4.2 ms after a gap in DRpilot_714748_20240628). As an anchor it puts its delay in the gap's
+    residual. If the residual exceeds `LATE_ANCHOR_MIN_SEC` and the interval on the far side of
+    an anchor differs from the stim's by the same amount (`LATE_ANCHOR_TOLERANCE_SEC`), the
+    span is extended over that edge, so the frame is reconstructed with the others.
 
     Method (per gap, in time order): remove recorded edges in the span (copies, plus splice
     edges; see `splice_spans`), then choose the number of stim frames n inside the gap that
@@ -285,7 +312,6 @@ def solve_vsync_gaps(
     v_raw = np.sort(np.asarray(vsyncs, dtype=float))
     fi = np.asarray(frame_intervals, dtype=float)
     tf = np.concatenate([[0.0], np.cumsum(fi)])
-    n_stim = len(tf)
     period = float(np.median(np.diff(v_raw))) if len(v_raw) > 1 else np.nan
     overlapping = [
         (a, z)
@@ -293,6 +319,58 @@ def solve_vsync_gaps(
         if a <= v_raw[-1] and z > v_raw[0]
     ]
     spans = splice_spans(v_raw, overlapping, period) if overlapping else ()
+    rec = _solve_vsync_spans(v_raw, tf, spans)
+    for _ in range(2 * len(spans)):
+        extended = _spans_over_late_anchors(rec, v_raw, tf, spans)
+        if extended == spans:
+            break
+        spans = extended
+        rec = _solve_vsync_spans(v_raw, tf, spans)
+    return rec
+
+
+def _spans_over_late_anchors(
+    rec: VsyncReconciliation,
+    v_raw: npt.NDArray[np.float64],
+    tf: npt.NDArray[np.float64],
+    spans: Sequence[tuple[float, float]],
+) -> tuple[tuple[float, float], ...]:
+    """`spans`, with the span of each gap whose residual is a late anchor's delay (see
+    `solve_vsync_gaps`) extended over that anchor."""
+    v = v_raw[~in_intervals(v_raw, spans)]
+    out = {(float(a), float(z)): (float(a), float(z)) for a, z in spans}
+    eps = 1e-7  # < 1 sample
+    for g in rec.gaps:
+        r = g.residual_sec
+        if abs(r) <= LATE_ANCHOR_MIN_SEC or g.span not in out:
+            continue
+        j_before = int(np.searchsorted(v, g.time_before))
+        j_after = j_before + 1
+        k_after = g.frame_before + 1 + g.n_frames
+        if r > 0 and j_after + 1 < len(v) and k_after + 1 < len(tf):
+            # anchor after the gap is late: the next interval is short by the delay
+            short = (tf[k_after + 1] - tf[k_after]) - (v[j_after + 1] - v[j_after])
+            if abs(short - r) <= LATE_ANCHOR_TOLERANCE_SEC:
+                out[g.span] = (g.span[0], float(v[j_after]) + eps)
+                continue
+        if r < 0 and j_before >= 1 and g.frame_before >= 1:
+            # anchor before the gap is late: the interval before it is long by the delay
+            long = (v[j_before] - v[j_before - 1]) - (
+                tf[g.frame_before] - tf[g.frame_before - 1]
+            )
+            if abs(long + r) <= LATE_ANCHOR_TOLERANCE_SEC:
+                out[g.span] = (float(v[j_before]) - eps, g.span[1])
+    return merge_intervals(out.values())
+
+
+def _solve_vsync_spans(
+    v_raw: npt.NDArray[np.float64],
+    tf: npt.NDArray[np.float64],
+    spans: Sequence[tuple[float, float]],
+) -> VsyncReconciliation:
+    """`solve_vsync_gaps` for given spans (already extended over splice edges)."""
+    n_stim = len(tf)
+    period = float(np.median(np.diff(v_raw))) if len(v_raw) > 1 else np.nan
     removed = in_intervals(v_raw, spans)
     v = v_raw[~removed]
     boundary_gap = bool(removed[0] or removed[-1]) if len(v_raw) else False
@@ -2096,9 +2174,11 @@ def build_sync_patch(
         rec: VsyncReconciliation | None = None
         if overlapping:
             rec = solve_vsync_gaps(block, sb.frame_intervals, overlapping)
-            plain = (
-                not raw.timebase_discontinuities
-                and len(invalid) < VSYNC_PLAIN_MAX_REPLAYS
+            # every drop located on periodic lines: no anchor can be displaced by a buffer
+            # (0.42 ms on the vsync line), which is what the stricter gate guards against
+            located = timebase is not None and not timebase.has_assumed_drops
+            plain = not raw.timebase_discontinuities and (
+                located or len(invalid) < VSYNC_PLAIN_MAX_REPLAYS
             )
             failures = rec.failures(
                 VSYNC_MAX_GAP_RESIDUAL_PLAIN_SEC

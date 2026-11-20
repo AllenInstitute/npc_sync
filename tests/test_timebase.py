@@ -307,3 +307,31 @@ def test_build_timebase_checks() -> None:
     tb = T.build_timebase(1_000_000)
     assert tb.is_identity and tb.dropped == () and tb.total_samples_true == 1_000_000
     assert T.Timebase.from_dict(tb.to_dict()) == tb
+
+
+def test_late_frame_signal_edge_at_a_gap_anchor(truth) -> None:
+    """The first vsync after a gap is 4 ms late and the next interval 4 ms short (a late
+    frame-signal falling edge): the gap takes that frame too instead of a 4 ms residual.
+    """
+    frames, fi = truth["frames"], truth["fi"]
+    span = (50.0, 50.5)
+    v = frames[~P.in_intervals(frames, [span])].copy()
+    j = int(np.searchsorted(v, span[1]))
+    n_inside = int(P.in_intervals(frames, [span]).sum())
+    plain = P.solve_vsync_gaps(v, fi, [span])
+    assert (
+        plain.gaps[0].n_frames == n_inside and abs(plain.gaps[0].residual_sec) < 2 / FS
+    )
+    for late, anchor in ((v.copy(), j), (v.copy(), j - 1)):
+        late[anchor] += 0.004
+        rec = P.solve_vsync_gaps(late, fi, [span])
+        (g,) = rec.gaps
+        assert rec.balance == 0 and not rec.failures()
+        assert g.n_frames == n_inside + 1 and abs(g.residual_sec) < 2 / FS
+        assert (
+            np.nanmax(np.abs(rec.times - frames)) < 2 / FS
+        )  # the late frame is on time
+    # a residual that no neighbouring interval explains is left alone
+    off = v.copy()
+    off[j:] += 0.004
+    assert abs(P.solve_vsync_gaps(off, fi, [span]).gaps[0].residual_sec) > 3.9e-3
