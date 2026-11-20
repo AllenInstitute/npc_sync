@@ -26,15 +26,21 @@ LABELS[28] = "beh_cam_frame_readout"
 LABELS[31] = "lick_sensor"
 
 
-def _truth(seed: int = 0, duration: float = 60.0, stim_start: float = 5.0, n_frames: int = 3000):
+def _truth(
+    seed: int = 0,
+    duration: float = 60.0,
+    stim_start: float = 5.0,
+    n_frames: int = 3000,
+    vsync_width: float = 0.002,
+):
     rng = np.random.default_rng(seed)
     fi = np.full(n_frames - 1, 1 / 60) + rng.normal(0, 2e-5, n_frames - 1)
     for i in (700, 1500, 1520, 2400):  # dropped frames
         fi[i] = 3 / 60
     frames = stim_start + np.r_[0, np.cumsum(fi)]
     edges: dict[int, list[tuple[float, int]]] = {b: [] for b in range(32)}
-    for t in frames:  # vsync: rising 2 ms before the falling edge
-        edges[2] += [(t - 0.002, 1), (t, 0)]
+    for t in frames:  # vsync: rising `vsync_width` (2 ms) before the falling edge
+        edges[2] += [(t - vsync_width, 1), (t, 0)]
     pol = 1
     for f in range(0, n_frames, 3):  # diode toggles every 3 frames, polarity-dependent latency
         edges[4].append((frames[f] + (0.020 if pol else 0.024), pol))
@@ -291,7 +297,10 @@ def test_camera_startup_pwm_section_is_excluded_from_the_fit() -> None:
     width = np.r_[np.full(10, 0.002), np.full(1190, 0.016)]
     falling = rising + width
     span = (20.5, 22.0)
-    rec_r, rec_f = rising[~P.in_intervals(rising, [span])], falling[~P.in_intervals(falling, [span])]
+    rec_r, rec_f = (
+        rising[~P.in_intervals(rising, [span])],
+        falling[~P.in_intervals(falling, [span])],
+    )
     pwm = P.startup_pwm_section(rec_r, rec_f)
     assert len(pwm) == 1 and pwm[0][0] == pytest.approx(12.0)
     _, old = P.interpolate_periodic_edges(rec_f, span)
@@ -321,3 +330,57 @@ def test_plain_file_gate_admits_sub_ms_residual(replayed) -> None:
     patch = P.build_sync_patch(raw, [P.StimBlock(0, fi, 3, "synthetic")], builder="test")
     assert all(sp.status != "unknown" for sp in patch.lines["vsync_stim"])
     assert patch.lines["vsync_stim"]
+
+
+@pytest.fixture(scope="module")
+def replayed_wide(tmp_path_factory):
+    """As `replayed`, with a 15.9 ms vsync pulse (real files): a frame's rising edge sits just
+    after the previous frame's falling edge. Frames start 0.7 ms early so that both spans start
+    between a falling edge and the next rising edge (measured before the span), and the first
+    falling edge after each span has its rising edge inside the span."""
+    fi, frames, edges, cam, licks = _truth(vsync_width=0.0159, stim_start=4.9993)
+    t, s = _events(edges)
+    t, s, iv1 = _replay(t, s, genuine_buffer=40, n_copies=4)
+    t, s, iv2 = _replay(t, s, genuine_buffer=61, n_copies=1)
+    path = _write(tmp_path_factory.mktemp("sync") / "replayed_wide.h5", t, s, 60.0)
+    return dict(path=path, fi=fi, frames=frames, intervals=(iv1, iv2))
+
+
+def _assert_alternates(s: npc_sync.SyncDataset) -> None:
+    """Every line alternates rising/falling, except across its unknown intervals."""
+    for bit in range(32):
+        r = s.get_rising_edges(bit, units="seconds")
+        f = s.get_falling_edges(bit, units="seconds")
+        t = np.r_[r, f]
+        rising = np.r_[np.ones(len(r), bool), np.zeros(len(f), bool)]
+        o = np.argsort(t, kind="stable")
+        t, rising = t[o], rising[o]
+        same = np.flatnonzero(rising[1:] == rising[:-1])
+        unknown = s.get_unknown_intervals(bit)
+        for i in same:
+            assert any(a < t[i + 1] and z > t[i] for a, z in unknown), (
+                f"line {bit}: two {'rising' if rising[i] else 'falling'} edges at {t[i]:.5f}, {t[i + 1]:.5f}"
+            )
+
+
+def test_vsync_rising_edges_alternate_with_wide_pulse(replayed_wide) -> None:
+    """GH 5: fails under <= 0.3.8 (a rising-rising pair at the start and a falling-falling pair
+    at the end of each reconstructed span)."""
+    raw = npc_sync.SyncDataset(replayed_wide["path"], on_invalid="ignore")
+    patch = P.build_sync_patch(
+        raw, [P.StimBlock(0, replayed_wide["fi"], 3, "synthetic")], builder="test"
+    )
+    assert all(sp.status == "reconstructed" for sp in patch.lines["vsync_stim"])
+    s = npc_sync.SyncDataset(replayed_wide["path"], patch=patch)
+    frames = replayed_wide["frames"]
+    r = s.get_rising_edges("vsync_stim", units="seconds")
+    assert len(r) == len(frames) and np.max(np.abs(r - (frames - 0.0159))) < 3 / FS
+    _assert_alternates(s)
+
+
+def test_patched_lines_alternate(replayed) -> None:
+    raw = npc_sync.SyncDataset(replayed["path"], on_invalid="ignore")
+    patch = P.build_sync_patch(
+        raw, [P.StimBlock(0, replayed["fi"], 3, "synthetic")], builder="test"
+    )
+    _assert_alternates(npc_sync.SyncDataset(replayed["path"], patch=patch))
