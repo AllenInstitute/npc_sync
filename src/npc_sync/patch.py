@@ -547,6 +547,19 @@ def startup_pwm_section(
     return ((float(r[0]), float(fall[n - 1])),)
 
 
+def _period_index(edges: npt.NDArray[np.float64]) -> npt.NDArray[np.float64]:
+    """Number of periods from the first edge to each edge of a periodic line with gaps.
+
+    >>> _period_index(np.array([0.0, 1.0, 2.01, 5.0, 6.0])).tolist()
+    [0.0, 1.0, 2.0, 5.0, 6.0]
+    """
+    dt = np.diff(edges)
+    if dt.size == 0:
+        return np.zeros(edges.size)
+    period = float(np.median(dt))
+    return np.r_[0.0, np.cumsum(np.maximum(np.round(dt / period), 1.0))]
+
+
 def interpolate_periodic_edges(
     edges: npt.ArrayLike,
     span: tuple[float, float],
@@ -601,7 +614,9 @@ def interpolate_periodic_edges(
             n_removed=n_removed,
             reason=f"line active on one side only ({before.size} edges before, {after.size} after)",
         )
-    ib, ia = np.arange(before.size), np.arange(after.size)
+    # period index of each edge: other invalid intervals in the window leave gaps (on a
+    # timebase there are no copies to fill them), so count periods instead of edges
+    ib, ia = _period_index(before), _period_index(after)
     fb, fa = np.polyfit(ib, before, 1), np.polyfit(ia, after, 1)
     p = 0.5 * (fb[0] + fa[0])
     fit_resid = max(
@@ -1433,6 +1448,14 @@ def predict_box1_diode_edges(
     after_hold = np.r_[False, al.n_refreshes >= 2]
     regular = (al.frame_edge >= 0) & ~after_hold
     regular[al.second_pass] = False
+    # a late frame-signal falling edge below the first-pass tolerance (the frame is displayed
+    # on time, so its toggle is early by the delay: 4.5 ms in two spans of 708020_20240517,
+    # 0.34 s after the span) is not a second-pass match: leave out frames whose interval from
+    # the previous frame is off the refresh grid
+    with np.errstate(invalid="ignore"):
+        n_ref = np.diff(ft) / al.refresh_sec
+        off_grid = np.abs(n_ref - np.round(n_ref)) > DIODE_OFF_GRID_FRACTION
+    regular &= ~np.r_[False, off_grid]
     e_t = np.where(
         al.frame_edge >= 0, al.edge_times[np.clip(al.frame_edge, 0, None)], np.nan
     )
@@ -1980,8 +2003,9 @@ def build_sync_patch(
     # one sample early. On a timebase, the first sample after a dropped interval holds the
     # edge of every line whose state differs across it (`SyncDataset._true_events`): the edge
     # happened at an unknown time inside the interval, so every span also ends one sample late
-    late = 1 / fs if timebase is not None else 0.0
-    spans_base = tuple((a - 1 / fs, z + late) for a, z in invalid)
+    # (bounds are half a sample beyond those samples: times are sample / fs in floating point)
+    late = 0.5 / fs if timebase is not None else 0.0
+    spans_base = tuple((a - 1.5 / fs, z + late) for a, z in invalid)
 
     labels = [line_key(raw.line_labels, bit) for bit in range(len(raw.line_labels))]
     # --- vsync + photodiode ----------------------------------------------------------

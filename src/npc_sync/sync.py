@@ -549,9 +549,9 @@ class SyncDataset:
         (or a drop) can carry the state of the data after it. With a `timebase`, also ending
         one sample late: the first sample after a dropped interval holds the edges of every
         line whose state differs across it (see `npc_sync.patch.build_sync_patch`)."""
-        dt = 1 / self.sample_freq
-        late = dt if self.timebase is not None else 0.0
-        return tuple((a - dt, z + late) for a, z in self.invalid_intervals)
+        dt = 1 / self.sample_freq  # bounds half a sample beyond the samples to drop
+        late = 0.5 * dt if self.timebase is not None else 0.0
+        return tuple((a - 1.5 * dt, z + late) for a, z in self.invalid_intervals)
 
     def _invalid_message(self, key: str) -> str:
         shown = ", ".join(f"{a:.3f}-{z:.3f} s" for a, z in self.invalid_intervals[:5])

@@ -295,11 +295,12 @@ def test_camera_startup_pwm_section_is_excluded_from_the_fit() -> None:
     pwm = P.startup_pwm_section(rec_r, rec_f)
     assert len(pwm) == 1 and pwm[0][0] == pytest.approx(12.0)
     _, old = P.interpolate_periodic_edges(rec_f, span)
-    # the PWM section skews the fit (fails the former 0.1 ms gate; within the current one)
-    assert old.failures(max_residual_sec=0.1e-3)
-    assert abs(old.residual_sec) > 0.1e-3
+    # the PWM section skews the fit: -0.146 ms residual when edges were indexed by count
+    # (<= 0.3.7); indexed by period count (0.3.8) the 14 ms step still leaves ms-scale fit
+    # residuals
+    assert old.fit_residual_max_sec > 1e-3
     new, sol = P.interpolate_periodic_edges(rec_f, span, fit_exclude=pwm)
-    assert not sol.failures()
+    assert not sol.failures() and sol.fit_residual_max_sec < 1e-6
     truth = falling[P.in_intervals(falling, [span])]
     assert len(new) == len(truth) and np.max(np.abs(new - truth)) < 1e-6
 
