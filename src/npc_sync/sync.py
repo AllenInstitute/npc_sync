@@ -476,6 +476,14 @@ class SyncDataset:
                     "patch was built on a different timebase than the one requested"
                 )
         self.timebase = resolved
+        if isinstance(path, self.__class__):
+            # views of one file share what is computed from the recorded data
+            shared = ["_replayed_buffers"]
+            if resolved is not None and resolved == path.timebase:
+                shared.append("_true_events")
+            for name in shared:
+                if name in path.__dict__:
+                    self.__dict__[name] = path.__dict__[name]
         if stim_paths is None:
             self.stim_paths = None
         else:
