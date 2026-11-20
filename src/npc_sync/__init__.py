@@ -9,6 +9,7 @@ import logging
 # import functions from submodules here:
 from npc_sync.patch import *
 from npc_sync.sync import *
+from npc_sync.timebase import *
 
 
 def __getattr__(name: str):

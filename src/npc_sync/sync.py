@@ -27,10 +27,18 @@ import upath
 
 from npc_sync.patch import (
     MEASURED,
+    PERIODIC_LINE_SUFFIXES,
     SyncFaultError,
     SyncPatch,
     in_intervals,
     line_key,
+    merge_intervals,
+)
+from npc_sync.timebase import (
+    DEFAULT_CHUNK_SAMPLES,
+    Timebase,
+    build_timebase,
+    find_chunk_jumps,
 )
 
 if TYPE_CHECKING:
@@ -405,6 +413,14 @@ class SyncDataset:
     inside `invalid_intervals`, and measured edges removed anywhere (photodiode phantom flicker
     and glitches)."""
 
+    timebase: Timebase | None
+    """Map from recorded to true sample numbers (see `npc_sync.timebase`), or None if samples
+    are used as recorded. With a timebase, every event query (edges, `get_all_events`,
+    `invalid_intervals`, `total_seconds`, ...) is on the true clock: data recorded early
+    because of dropped acquisition buffers is moved to where it belongs, replayed copies are
+    removed, and `invalid_intervals` are the intervals that no recorded buffer holds. Taken
+    from `patch` if it has one. Analog channels are not remapped."""
+
     on_invalid: OnInvalid
     """What edge queries do on a line whose data inside `invalid_intervals` is not covered by
     `patch` (a line the patch covers always gets the patch):
@@ -422,15 +438,44 @@ class SyncDataset:
         stim_paths: Iterable[npc_io.PathLike] | None = None,
         patch: SyncPatch | None = None,
         on_invalid: OnInvalid | None = None,
+        timebase: Timebase | Literal[False] | None = None,
     ) -> None:
+        """
+        timebase
+            None (default): the patch's timebase if `patch` is given; else the timebase of
+            `path` if it is a `SyncDataset`; else none (samples as recorded). False: samples
+            as recorded. See `find_timebase`.
+        """
+        inherited: Timebase | None = None
         if isinstance(path, self.__class__):
             self.path = path.path
             self.dfile = path.dfile
+            inherited = path.timebase
             if patch is None and on_invalid is None:  # same view as `path`
                 patch, on_invalid = path.patch, path.on_invalid
         else:
             self.path = npc_io.from_pathlike(path)
             self.dfile = self.load(path)
+        resolved: Timebase | None
+        if timebase is False:
+            resolved = None
+        elif timebase is not None:
+            resolved = timebase
+        elif patch is not None:
+            resolved = patch.timebase
+        else:
+            resolved = inherited
+        if resolved is not None and resolved.is_identity:
+            resolved = None
+        if patch is not None:
+            patch_timebase = patch.timebase
+            if patch_timebase is not None and patch_timebase.is_identity:
+                patch_timebase = None
+            if patch_timebase != resolved:
+                raise ValueError(
+                    "patch was built on a different timebase than the one requested"
+                )
+        self.timebase = resolved
         if stim_paths is None:
             self.stim_paths = None
         else:
@@ -441,6 +486,16 @@ class SyncDataset:
                 f"on_invalid must be 'raise', 'mask' or 'ignore': got {on_invalid!r}"
             )
         self.patch = patch
+        if self.timebase is not None:
+            if self.meta_data["ni_daq"]["counter_bits"] != 32:
+                raise NotImplementedError(
+                    "a timebase is only supported for 32-bit counter files"
+                )
+            if self.timebase.total_samples != self.meta_data["total_samples"]:
+                raise ValueError(
+                    f"timebase was built for a recording of {self.timebase.total_samples} "
+                    f"samples, this file has {self.meta_data['total_samples']}"
+                )
         if patch is not None and patch.sync_content_hash != self.content_hash:
             raise ValueError(
                 "patch was built for a different sync file (content hash "
@@ -479,11 +534,24 @@ class SyncDataset:
             return self._mask_intervals
         raise SyncFaultError(self._invalid_message(key))
 
+    def _bridge_intervals(self, line: str | int) -> tuple[tuple[float, float], ...]:
+        """Intervals without edges on `line` that are not gaps between stimulus blocks:
+        its unknown intervals, plus every dropped interval of a `timebase` (no data there,
+        whatever the invalid-interval policy)."""
+        unknown = self.get_unknown_intervals(line)
+        if self.timebase is None:
+            return unknown
+        return merge_intervals([*unknown, *self.invalid_intervals])
+
     @property
     def _mask_intervals(self) -> tuple[tuple[float, float], ...]:
         """Invalid intervals, starting one sample early: the event at the sample before a copy
-        can carry the copy's state (see `npc_sync.patch.build_sync_patch`)."""
-        return tuple((a - 1 / self.sample_freq, z) for a, z in self.invalid_intervals)
+        (or a drop) can carry the state of the data after it. With a `timebase`, also ending
+        one sample late: the first sample after a dropped interval holds the edges of every
+        line whose state differs across it (see `npc_sync.patch.build_sync_patch`)."""
+        dt = 1 / self.sample_freq
+        late = dt if self.timebase is not None else 0.0
+        return tuple((a - dt, z + late) for a, z in self.invalid_intervals)
 
     def _invalid_message(self, key: str) -> str:
         shown = ", ".join(f"{a:.3f}-{z:.3f} s" for a, z in self.invalid_intervals[:5])
@@ -768,7 +836,7 @@ class SyncDataset:
         Returns the data for all bits.
 
         """
-        return np.array(self.dfile["data"][()][:, -1])
+        return np.array(self.get_all_events()[:, -1])
 
     def get_all_times(self, units: Literal["samples", "seconds"]) -> npt.NDArray[Any]:
         """
@@ -794,9 +862,42 @@ class SyncDataset:
 
     def get_all_events(self) -> npt.NDArray[Any]:
         """
-        Returns all counter values and their cooresponding IO state.
+        Returns all counter values and their cooresponding IO state. With a `timebase`:
+        on the true sample clock, without the events of replayed copies.
         """
+        if self.timebase is None:
+            return self.get_recorded_events()
+        return np.array(self._true_events)
+
+    def get_recorded_events(self) -> npt.NDArray[Any]:
+        """Counter values and IO states as recorded in the file (no `timebase` applied)."""
         return np.array(self.dfile["data"][()])
+
+    @npc_io.cached_property
+    def _true_events(self) -> npt.NDArray[Any]:
+        """Recorded events on the true clock: copies removed, and a row added at the first
+        sample of each kept segment that has no event there, carrying the recorded state at
+        that sample. Lines whose state differs across a dropped interval then have their edge
+        at exactly the first sample after the interval (the edge happened at an unknown time
+        inside it), never at a later, real event."""
+        assert self.timebase is not None
+        events = self.get_recorded_events()
+        recorded = events[:, 0].astype(np.int64)
+        true, keep = self.timebase.to_true(recorded)
+        times = [true[keep]]
+        states = [events[keep, -1]]
+        for start, _, shift in self.timebase.segments[1:]:
+            i = int(np.searchsorted(recorded, start, side="right")) - 1
+            if i < 0 or recorded[i] == start:
+                continue
+            times.append(np.array([start + shift], dtype=np.int64))
+            states.append(events[i : i + 1, -1])
+        t = np.concatenate(times)
+        order = np.argsort(t, kind="stable")
+        out = np.empty((len(t), events.shape[1]), dtype=events.dtype)
+        out[:, 0] = t[order].astype(events.dtype)
+        out[:, -1] = np.concatenate(states)[order]
+        return out
 
     def get_events_by_bit(self, bit: int, units=Literal["seconds", "samples"]):
         """
@@ -1337,19 +1438,23 @@ class SyncDataset:
 
     @npc_io.cached_property
     def invalid_intervals(self) -> tuple[tuple[float, float], ...]:
-        """(start, stop) times in seconds of each interval of sync data that is a replayed
-        copy of a later acquisition buffer. Empty if none are found.
+        """(start, stop) times in seconds of each interval without real sync data on any
+        line. Empty if none are found.
 
-        Events in [start, stop) are not real on any line. The last buffer of each run of
-        identical buffers is assumed to be genuine and is not included. See
-        `find_replayed_buffers`.
+        - without a `timebase`: the replayed copies of a later acquisition buffer, on the
+          recorded clock. Events in [start, stop) are not real. The last buffer of each run
+          of identical buffers is genuine and is not included. See `find_replayed_buffers`.
+          Note that data recorded before a run can be displaced (see `npc_sync.timebase`).
+        - with a `timebase`: the intervals of true time that no recorded buffer holds
+          (`Timebase.dropped`): there are no events in them, except where a patch
+          reconstructs them.
         """
-        events = self.get_all_events()
-        if self.meta_data["ni_daq"]["counter_bits"] == 32:
-            times = events[:, 0]
-        else:
-            times = self.times
-        intervals, buffer_size = find_replayed_buffers(times, events[:, -1])
+        if self.timebase is not None:
+            return tuple(
+                (a / self.sample_freq, z / self.sample_freq)
+                for a, z in self.timebase.dropped
+            )
+        intervals, buffer_size = self._replayed_buffers
         result = tuple(
             (a / self.sample_freq, z / self.sample_freq) for a, z in intervals
         )
@@ -1360,6 +1465,71 @@ class SyncDataset:
                 f"{[(round(a, 3), round(z, 3)) for a, z in result]}"
             )
         return result
+
+    @npc_io.cached_property
+    def _replayed_buffers(self) -> tuple[tuple[tuple[int, int], ...], int | None]:
+        """(recorded sample intervals of replayed copies, buffer size), whatever this
+        dataset's `timebase`: see `find_replayed_buffers`."""
+        events = self.get_recorded_events()
+        if self.meta_data["ni_daq"]["counter_bits"] == 32:
+            times = events[:, 0]
+        else:
+            times = self.times
+        return find_replayed_buffers(times, events[:, -1])
+
+    def find_timebase(self, periodic_lines: Sequence[str] | None = None) -> Timebase:
+        """The file's timebase (see `npc_sync.timebase`), from the recorded data whatever
+        this dataset's own `timebase` is: replayed runs (`find_replayed_buffers`) plus the
+        dropped buffers located on periodic lines (camera exposing lines by default), at the
+        replayed buffer size (50,000 samples if the file has no replays).
+
+        The result is the identity (`Timebase.is_identity`) for a file without faults. Drops
+        that periodic lines can't locate are not in it: check `timebase_discontinuities` on
+        a dataset that uses it.
+
+        Use with `SyncDataset(path, timebase=...)`, or let `npc_sync.patch.build_sync_patch`
+        do so.
+        """
+        if self.meta_data["ni_daq"]["counter_bits"] != 32:
+            raise NotImplementedError(
+                "a timebase is only supported for 32-bit counter files"
+            )
+        events = self.get_recorded_events()
+        times = events[:, 0].astype(np.int64)
+        bits = events[:, -1]
+        replayed, buffer_size = self._replayed_buffers
+        chunk = buffer_size or DEFAULT_CHUNK_SAMPLES
+        labels = (
+            list(periodic_lines)
+            if periodic_lines is not None
+            else [
+                lab for lab in self.line_labels if lab.endswith(PERIODIC_LINE_SUFFIXES)
+            ]
+        )
+        edges: dict[str, npt.NDArray[np.int64]] = {}
+        for label in labels:
+            change = np.ediff1d(
+                get_bit(bits, self._line_to_bit(label)), to_begin=np.uint8(0)
+            )
+            edges[f"{label}:rising"] = times[change == 1]
+            edges[f"{label}:falling"] = times[change == 255]
+        total = int(self.meta_data["total_samples"])
+        jumps = find_chunk_jumps(edges, total, chunk)
+        timebase = build_timebase(
+            total, replayed=replayed, chunk_samples=chunk, jumps=jumps
+        )
+        if not timebase.is_identity:
+            drops = timebase.drops
+            logger.warning(
+                f"{self}: timebase: {sum(j.n_chunks for j in drops)} dropped buffer(s) of "
+                f"{chunk} samples at {len(drops)} place(s) "
+                f"({sum(j.source == 'assumed_at_run' for j in drops)} assumed at the start "
+                f"of a replayed run), {sum(j.n_chunks == -1 for j in timebase.jumps)} "
+                f"replayed copies; net shift "
+                f"{timebase.net_shift_samples / self.sample_freq:+.1f} s"
+                + (f"; {'; '.join(timebase.notes)}" if timebase.notes else "")
+            )
+        return timebase
 
     @npc_io.cached_property
     def timebase_discontinuities(self) -> tuple[tuple[float, float, float], ...]:
@@ -1399,6 +1569,9 @@ class SyncDataset:
 
     @property
     def total_seconds(self) -> float:
+        """Length of the recording (on the true clock, with a `timebase`)."""
+        if self.timebase is not None:
+            return self.timebase.total_samples_true / self.sample_freq
         return self.meta_data["total_samples"] / self.sample_freq
 
     @npc_io.cached_property
@@ -1423,7 +1596,7 @@ class SyncDataset:
             reshape_into_blocks(
                 vsync_falling_edges,
                 min_gap=1.0,
-                bridge=self.get_unknown_intervals("vsync_stim"),
+                bridge=self._bridge_intervals("vsync_stim"),
             )
         )
 
@@ -1477,7 +1650,7 @@ class SyncDataset:
         return reshape_into_blocks(
             self.filter_on_stim_running(edges, end_padding=end_padding),
             min_gap=1.0,
-            bridge=self.get_unknown_intervals(line),
+            bridge=self._bridge_intervals(line),
         )
 
     # deprecated: moved to npc_stim ------------------------------------------- #
@@ -1783,11 +1956,13 @@ def reshape_into_blocks(
     >>> reshape_into_blocks([0, 1, 2, 3])
     (array([0, 1, 2, 3]),)
 
-    Gaps that overlap a `bridge` interval (data unknown there, e.g. masked invalid
-    intervals) don't split blocks:
+    Time inside a `bridge` interval (data unknown there, e.g. masked invalid intervals)
+    doesn't count towards a gap:
 
     >>> reshape_into_blocks([0, 1, 2, 103, 104, 105], min_gap=100, bridge=[(50, 60)])
     (array([  0,   1,   2, 103, 104, 105]),)
+    >>> reshape_into_blocks([0, 1, 2, 203, 204, 205], min_gap=100, bridge=[(50, 60)])
+    (array([0, 1, 2]), array([203, 204, 205]))
     """
     indices = np.array(indices)
     intervals = np.diff(indices)
@@ -1804,7 +1979,10 @@ def reshape_into_blocks(
         if interval > long_interval_threshold:
             # large interval found
             gap_start, gap_stop = indices[interval_index], indices[interval_index + 1]
-            if any(a < gap_stop and z > gap_start for a, z in bridge):
+            unknown = sum(
+                max(0.0, min(z, gap_stop) - max(a, gap_start)) for a, z in bridge
+            )
+            if interval - unknown <= long_interval_threshold:
                 continue
             gaps_between_blocks.append(interval_index + 1)
         else:

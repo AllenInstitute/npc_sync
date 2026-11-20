@@ -1,10 +1,12 @@
-"""Reconstruct sync line events inside invalid (replayed) intervals, and carry them in a
-`SyncPatch` that `SyncDataset(path, patch=...)` applies.
+"""Reconstruct sync line events inside invalid intervals (data lost to dropped acquisition
+buffers), and carry them in a `SyncPatch` that `SyncDataset(path, patch=...)` applies.
 
-Background: some sync files contain runs of acquisition buffers that are copies of a later
-buffer (`SyncDataset.invalid_intervals`). The copies overwrite real data on every line, but the
-timebase after the run is correct. Events inside the copies are not real, so each line needs one
-of:
+Background: some sync files drop acquisition buffers, and some contain runs of buffers that are
+copies of a later buffer, which make up for buffers dropped up to several seconds earlier
+(`npc_sync.timebase`). The patch carries the file's `Timebase`: recorded data is moved to where
+it belongs in time, the copies are removed, and what is left are intervals that no recorded
+buffer holds (`SyncDataset.invalid_intervals` on that timebase). Every time in a patch is on
+that true clock. Each line then needs, in each interval, one of:
 
 - a reconstruction from an independent source with a known error (vsync from the stim file's
   `frameIntervals`, camera exposures from the camera's fixed period, the digital photodiode
@@ -33,9 +35,11 @@ from typing import Any, Literal
 import numpy as np
 import numpy.typing as npt
 
+from npc_sync.timebase import Timebase
+
 logger = logging.getLogger(__name__)
 
-PATCH_FORMAT_VERSION = 2
+PATCH_FORMAT_VERSION = 3
 """2: adds `SyncPatch.removed` (measured edges removed anywhere in the file) and
 `SyncPatch.diode_blocks`. Version-1 patches still load."""
 
@@ -1528,7 +1532,18 @@ class SpanPatch:
 
 @dataclasses.dataclass(frozen=True)
 class SyncFault:
-    kind: Literal["replay", "timebase_discontinuity"]
+    """A fault found in the file (provenance; the patch's `timebase` and spans are what is
+    applied).
+
+    - 'replay': replayed copies at recorded [start, stop) seconds
+    - 'drop': acquisition buffers dropped at recorded time `start` (= `stop`); the data
+      recorded after it was early by `-shift` seconds, until copies made up for it. In
+      `timebase`
+    - 'timebase_discontinuity': a barcode onset interval between `start` and `stop` (true
+      clock) that is still off by `shift` seconds with the timebase applied: not corrected
+    """
+
+    kind: Literal["replay", "drop", "timebase_discontinuity"]
     start: float
     stop: float
     shift: float = 0.0
@@ -1620,7 +1635,11 @@ class DiodeBlockPatch:
 class SyncPatch:
     """Corrections to the recorded edges of one sync file.
 
-    - `lines`: per-line replacement edges inside invalid (replayed) intervals. A line with a
+    - `timebase`: the map from recorded to true sample numbers (`npc_sync.timebase`), or None
+      if samples are used as recorded. `SyncDataset(path, patch=...)` applies it first: every
+      other time in the patch (`invalid_intervals`, spans, removed samples, diode blocks) is
+      on the true clock.
+    - `lines`: per-line replacement edges inside invalid intervals. A line with a
       `SpanPatch` for every invalid interval returns measured edges outside the spans plus the
       patch's edges inside; spans with status 'unknown' return nothing inside (see
       `SyncDataset.get_unknown_intervals`). A line without patches raises on edge queries
@@ -1649,6 +1668,7 @@ class SyncPatch:
     removed: dict[str, list[RemovedEdges]] = dataclasses.field(default_factory=dict)
     """line label -> measured edges removed."""
     diode_blocks: list[DiodeBlockPatch] = dataclasses.field(default_factory=list)
+    timebase: Timebase | None = None
 
     # application ---------------------------------------------------------------------- #
 
@@ -1739,11 +1759,12 @@ class SyncPatch:
             "notes": list(self.notes),
             "removed": {k: [r.to_dict() for r in v] for k, v in self.removed.items()},
             "diode_blocks": [b.to_dict() for b in self.diode_blocks],
+            "timebase": None if self.timebase is None else self.timebase.to_dict(),
         }
 
     @classmethod
     def from_dict(cls, d: Mapping[str, Any]) -> SyncPatch:
-        if d.get("format_version") not in (1, PATCH_FORMAT_VERSION):
+        if d.get("format_version") not in (1, 2, PATCH_FORMAT_VERSION):
             raise ValueError(f"unsupported patch format {d.get('format_version')!r}")
         return cls(
             sync_content_hash=d["sync_content_hash"],
@@ -1764,6 +1785,7 @@ class SyncPatch:
             diode_blocks=[
                 DiodeBlockPatch.from_dict(b) for b in d.get("diode_blocks", [])
             ],
+            timebase=(Timebase.from_dict(d["timebase"]) if d.get("timebase") else None),
         )
 
     def to_json(self) -> str:
@@ -1865,9 +1887,10 @@ def build_sync_patch(
     builder: str = "",
     periodic_lines: Sequence[str] | None = None,
 ) -> SyncPatch:
-    """Build a `SyncPatch` for a sync file: phantom-flicker removal on the photodiode line of
-    every box-1 block with a stim file (any file), and reconstructions inside invalid (replayed)
-    intervals.
+    """Build a `SyncPatch` for a sync file: its timebase (`SyncDataset.find_timebase`:
+    dropped and replayed acquisition buffers), phantom-flicker removal on the photodiode line
+    of every box-1 block with a stim file (any file), and reconstructions inside the invalid
+    intervals of that timebase (true time that no recorded buffer holds).
 
     - `stim_photodiode`, every block with a matched stim file and diodeBoxFrameInterval 1: edges
       aligned with the block's frames (`align_diode_toggles`, with reconstructed vsyncs where the
@@ -1895,38 +1918,70 @@ def build_sync_patch(
     ----------
     sync
         A `SyncDataset` (read with `on_invalid='ignore'` and no patch internally, so the edges
-        are as recorded).
+        are as measured). Its `timebase` is used if it has one, else `find_timebase()`.
     stim_blocks
-        Stim data per vsync block index (`SyncDataset.vsync_times_in_blocks` order, unpatched).
+        Stim data per vsync block index: `SyncDataset.vsync_times_in_blocks` order of an
+        unpatched view on the same timebase, i.e.
+        `SyncDataset(sync, on_invalid='ignore', timebase=sync.find_timebase())`.
     builder
         Identifier of the calling builder (recorded in the patch), e.g. 'npc_sessions 0.0.292'.
     """
     from npc_sync.sync import SyncDataset  # avoid import cycle
 
-    raw = SyncDataset(sync, on_invalid="ignore")
+    source = SyncDataset(sync, on_invalid="ignore")
+    timebase = source.timebase
+    if timebase is None and source.meta_data["ni_daq"]["counter_bits"] == 32:
+        timebase = source.find_timebase()
+    if timebase is not None and timebase.is_identity:
+        timebase = None
+    raw = SyncDataset(
+        source, on_invalid="ignore", timebase=timebase if timebase else False
+    )
     raw.patch = None
     invalid = tuple(raw.invalid_intervals)
+    fs = raw.sample_freq
     import importlib.metadata
 
+    recorded = SyncDataset(source, on_invalid="ignore", timebase=False)
+    recorded.patch = None
+    chunk_sec = timebase.chunk_samples / fs if timebase is not None else 0.0
     patch = SyncPatch(
         sync_content_hash=raw.content_hash,
         builder=builder or f"npc_sync {importlib.metadata.version('npc_sync')}",
         invalid_intervals=invalid,
-        faults=tuple(SyncFault("replay", a, z) for a, z in invalid)
+        timebase=timebase,
+        faults=tuple(
+            SyncFault("replay", a / fs, z / fs)
+            for a, z in recorded._replayed_buffers[0]
+        )
+        + tuple(
+            SyncFault("drop", j.sample / fs, j.sample / fs, -j.n_chunks * chunk_sec)
+            for j in (timebase.drops if timebase is not None else ())
+        )
         + tuple(
             SyncFault("timebase_discontinuity", a, z, d)
             for a, z, d in raw.timebase_discontinuities
         ),
     )
+    if timebase is not None:
+        patch.notes.extend(timebase.notes)
+        if timebase.has_assumed_drops:
+            patch.notes.append(
+                "dropped buffers not located on periodic lines for some replayed runs: "
+                "assumed at the start of the run"
+            )
     if raw.timebase_discontinuities:
         patch.notes.append(
-            "file has timebase discontinuities: edges after them are shifted; not corrected by this patch"
+            "barcode onset intervals are still irregular with the timebase applied: edges "
+            "after them are shifted; not corrected by this patch"
         )
-    fs = raw.sample_freq
     # in 4 of 6 replays checked, the event at the sample before a copy already carries the
     # copy's state (experiments/sync-patch-manifest/acceptance_local7.log), so every span starts
-    # one sample early
-    spans_base = tuple((a - 1 / fs, z) for a, z in invalid)
+    # one sample early. On a timebase, the first sample after a dropped interval holds the
+    # edge of every line whose state differs across it (`SyncDataset._true_events`): the edge
+    # happened at an unknown time inside the interval, so every span also ends one sample late
+    late = 1 / fs if timebase is not None else 0.0
+    spans_base = tuple((a - 1 / fs, z + late) for a, z in invalid)
 
     labels = [line_key(raw.line_labels, bit) for bit in range(len(raw.line_labels))]
     # --- vsync + photodiode ----------------------------------------------------------
@@ -2129,7 +2184,11 @@ def build_sync_patch(
             )
             continue
         # box interval 1: align every measured edge with the block's frames
-        d_spans = [_extend_span_over_splice(raw, diode_bit, sp) for sp in gap_spans]
+        d_spans = (
+            list(gap_spans)
+            if timebase is not None
+            else [_extend_span_over_splice(raw, diode_bit, sp) for sp in gap_spans]
+        )
         in_win = (d_times >= block[0]) & (
             d_times < block[-1] + DIODE_BLOCK_END_PADDING_SEC
         )
@@ -2363,7 +2422,8 @@ def build_sync_patch(
             )
             for a, z in spans_base
         ]
-    _extend_unknown_spans_over_splice(raw, patch)
+    if timebase is None:
+        _extend_unknown_spans_over_splice(raw, patch)
     return patch
 
 
