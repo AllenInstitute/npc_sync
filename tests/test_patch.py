@@ -32,15 +32,24 @@ def _truth(
     stim_start: float = 5.0,
     n_frames: int = 3000,
     vsync_width: float = 0.002,
+    vsync_low: float | None = None,
+    frame_intervals: dict[int, float] | None = None,
 ):
     rng = np.random.default_rng(seed)
     fi = np.full(n_frames - 1, 1 / 60) + rng.normal(0, 2e-5, n_frames - 1)
     for i in (700, 1500, 1520, 2400):  # dropped frames
         fi[i] = 3 / 60
+    for i, x in (frame_intervals or {}).items():
+        fi[i] = x
     frames = stim_start + np.r_[0, np.cumsum(fi)]
     edges: dict[int, list[tuple[float, int]]] = {b: [] for b in range(32)}
-    for t in frames:  # vsync: rising `vsync_width` (2 ms) before the falling edge
-        edges[2] += [(t - vsync_width, 1), (t, 0)]
+    # vsync: rising `vsync_width` (2 ms) before the falling edge, or, with `vsync_low`, no
+    # sooner than `vsync_low` after the previous falling edge (short frames: shorter pulse)
+    vsync_rising = frames - vsync_width
+    if vsync_low is not None:
+        vsync_rising[1:] = np.maximum(vsync_rising[1:], frames[:-1] + vsync_low)
+    for r, t in zip(vsync_rising, frames):
+        edges[2] += [(r, 1), (t, 0)]
     pol = 1
     for f in range(0, n_frames, 3):  # diode toggles every 3 frames, polarity-dependent latency
         edges[4].append((frames[f] + (0.020 if pol else 0.024), pol))
@@ -54,7 +63,7 @@ def _truth(
     licks = licks[np.r_[True, np.diff(licks) > 0.1]]
     for t in licks:
         edges[31] += [(t, 1), (t + 0.03, 0)]
-    return fi, frames, edges, cam, licks
+    return fi, frames, edges, cam, licks, vsync_rising
 
 
 def _events(edges: dict[int, list[tuple[float, int]]]) -> tuple[np.ndarray, np.ndarray]:
@@ -106,7 +115,7 @@ def _write(path: pathlib.Path, times, states, duration: float) -> pathlib.Path:
 @pytest.fixture(scope="module")
 def replayed(tmp_path_factory):
     """One block with two replays: 2 s (buffers 36-39 copies of 40) and 0.5 s (60 of 61)."""
-    fi, frames, edges, cam, licks = _truth()
+    fi, frames, edges, cam, licks, _ = _truth()
     t, s = _events(edges)
     t, s, iv1 = _replay(t, s, genuine_buffer=40, n_copies=4)
     t, s, iv2 = _replay(t, s, genuine_buffer=61, n_copies=1)
@@ -256,7 +265,7 @@ def test_patch_without_stim_leaves_vsync_unknown(replayed) -> None:
 
 
 def test_clean_file_unchanged(tmp_path) -> None:
-    fi, frames, edges, cam, licks = _truth()
+    fi, frames, edges, cam, licks, _ = _truth()
     t, s = _events(edges)
     path = _write(tmp_path / "clean.h5", t, s, 60.0)
     d = npc_sync.SyncDataset(path)
@@ -338,7 +347,7 @@ def replayed_wide(tmp_path_factory):
     after the previous frame's falling edge. Frames start 0.7 ms early so that both spans start
     between a falling edge and the next rising edge (measured before the span), and the first
     falling edge after each span has its rising edge inside the span."""
-    fi, frames, edges, cam, licks = _truth(vsync_width=0.0159, stim_start=4.9993)
+    fi, frames, edges, cam, licks, _ = _truth(vsync_width=0.0159, stim_start=4.9993)
     t, s = _events(edges)
     t, s, iv1 = _replay(t, s, genuine_buffer=40, n_copies=4)
     t, s, iv2 = _replay(t, s, genuine_buffer=61, n_copies=1)
@@ -384,3 +393,68 @@ def test_patched_lines_alternate(replayed) -> None:
         raw, [P.StimBlock(0, replayed["fi"], 3, "synthetic")], builder="test"
     )
     _assert_alternates(npc_sync.SyncDataset(replayed["path"], patch=patch))
+
+
+SHORT_FRAMES = {i + k: x for i in (838, 1508) for k, x in enumerate((2 / 60, 0.0025, 0.0143))}
+"""A late flip then a quick one (33.3, 2.5, 14.3 ms), inside each replayed span of
+`replayed_wide`: frame intervals shorter than the 15.9 ms pulse width."""
+
+
+@pytest.fixture(scope="module")
+def replayed_short(tmp_path_factory):
+    """As `replayed_wide`, with `SHORT_FRAMES` and the real line's low phase: after a short
+    frame the rising edge follows the previous falling edge by the usual ~0.8 ms and the pulse
+    is shorter."""
+    fi, frames, edges, cam, licks, rising = _truth(
+        vsync_width=0.0159,
+        vsync_low=1 / 60 - 0.0159,
+        stim_start=4.9993,
+        frame_intervals=SHORT_FRAMES,
+    )
+    t, s = _events(edges)
+    t, s, iv1 = _replay(t, s, genuine_buffer=40, n_copies=4)
+    t, s, iv2 = _replay(t, s, genuine_buffer=61, n_copies=1)
+    path = _write(tmp_path_factory.mktemp("sync") / "replayed_short.h5", t, s, 60.0)
+    return dict(path=path, fi=fi, frames=frames, rising=rising, intervals=(iv1, iv2))
+
+
+def test_vsync_rising_edges_alternate_with_short_frames(replayed_short) -> None:
+    """GH 6: fails under <= 0.3.9 (rising = falling - pulse width puts the rising edge of the
+    2.5 ms frame before the previous falling edge: a rising-rising then a falling-falling pair
+    inside each reconstructed span)."""
+    frames, intervals = replayed_short["frames"], replayed_short["intervals"]
+    short = np.array(sorted(SHORT_FRAMES)) + 1
+    assert all(P.in_intervals(frames[short], intervals))  # the short frames are in the spans
+    raw = npc_sync.SyncDataset(replayed_short["path"], on_invalid="ignore")
+    patch = P.build_sync_patch(
+        raw, [P.StimBlock(0, replayed_short["fi"], 3, "synthetic")], builder="test"
+    )
+    spans = patch.lines["vsync_stim"]
+    assert all(sp.status == "reconstructed" for sp in spans)
+    assert all(
+        sp.diagnostics["low_width_sec"] == pytest.approx(1 / 60 - 0.0159, abs=1e-4)
+        for sp in spans
+    )
+    s = npc_sync.SyncDataset(replayed_short["path"], patch=patch)
+    r = s.get_rising_edges("vsync_stim", units="seconds")
+    f = s.get_falling_edges("vsync_stim", units="seconds")
+    assert len(r) == len(f) == len(frames)
+    assert np.max(np.abs(f - frames)) < 3 / FS  # frame times unaffected
+    assert np.all(r[1:] > f[:-1]) and np.all(r < f)  # rising_k between falling_k-1 and falling_k
+    assert np.max(np.abs(r - replayed_short["rising"])) < 3 / FS
+    _assert_alternates(s)
+
+
+def test_vsync_rising_edges_model() -> None:
+    f = np.array([1.0, 1.0333, 1.0358, 1.0501, 1.0668])
+    p = np.r_[0.9833, f[:-1]]
+    r = P._vsync_rising_edges(f, p, 0.0159, 0.0008)
+    assert r == pytest.approx(
+        [1.0 - 0.0159, 1.0333 - 0.0159, 1.0333 + 0.0008, 1.0358 + 0.0008, 1.0668 - 0.0159]
+    )
+    # no low phase measured: falling - width, unless before the previous falling edge
+    r = P._vsync_rising_edges(f, p, 0.0159, np.nan)
+    assert r[1:4] == pytest.approx([1.0333 - 0.0159, (1.0333 + 1.0358) / 2, (1.0358 + 1.0501) / 2])
+    # a frame shorter than the low phase: midpoint
+    r = P._vsync_rising_edges(np.r_[1.0005], np.r_[1.0], 0.0159, 0.0008)
+    assert r == pytest.approx([1.00025])

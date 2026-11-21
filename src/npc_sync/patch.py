@@ -82,6 +82,12 @@ frame-count margin still applies."""
 VSYNC_PLAIN_MAX_REPLAYS = 20
 VSYNC_MIN_SECOND_BEST_MARGIN_SEC = 10e-3
 """The second-best frame count for a gap must be at least this much worse than the best."""
+VSYNC_LOW_WIDTH_PERCENTILE = 1
+"""Reconstructed vsync rising edges are no sooner than this percentile of the measured low phase
+(rising - previous falling edge) after the previous falling edge. The low phase is nearly
+constant (~0.8-1.2 ms on 714748_2024-06-28; after frames shorter than the pulse width the
+pulse shrinks, not the low phase). A low percentile, not the median, so that rising edges of
+frames of normal length stay at falling - pulse width."""
 PERIODIC_MAX_RESIDUAL_SEC = 2e-3
 """Max residual of integer-period interpolation across a gap (camera lines).
 
@@ -2212,14 +2218,26 @@ def build_sync_patch(
             widths = in_block_f[ok] - vr_all[j[ok]]
             widths = widths[~in_intervals(in_block_f[ok], [g.span for g in rec.gaps])]
             width = float(np.median(widths))
+            # low phase (rising - previous falling) from measured edges in the block
+            in_block_r = vr_all[(vr_all >= block[0]) & (vr_all <= block[-1])]
+            j = np.searchsorted(vf_all, in_block_r) - 1
+            ok = j >= 0
+            lows = in_block_r[ok] - vf_all[j[ok]]
+            gap_spans_ = [g.span for g in rec.gaps]
+            lows = lows[
+                ~in_intervals(in_block_r[ok], gap_spans_)
+                & ~in_intervals(vf_all[j[ok]], gap_spans_)
+            ]
+            low = float(np.percentile(lows, VSYNC_LOW_WIDTH_PERCENTILE)) if len(lows) else np.nan
             for g in rec.gaps:
                 idx = np.arange(g.frame_before + 1, g.frame_before + 1 + g.n_frames)
                 fall = rec.times[idx]
+                prev = rec.times[idx - 1] if g.frame_before >= 0 else np.r_[-np.inf, fall[:-1]]
                 vsync_spans.append(
                     SpanPatch(
                         g.span,
                         "reconstructed",
-                        rising=fall - width,
+                        rising=_vsync_rising_edges(fall, prev, width, low),
                         falling=fall,
                         method="frame_intervals",
                         error_bound_sec=VSYNC_MAX_GAP_RESIDUAL_SEC,
@@ -2232,6 +2250,7 @@ def build_sync_patch(
                             "anchor_residual_sec": g.residual_sec,
                             "second_best_sec": g.second_best_sec,
                             "pulse_width_sec": width,
+                            "low_width_sec": low if np.isfinite(low) else None,
                         },
                     )
                 )
@@ -2534,13 +2553,34 @@ def build_sync_patch(
     return patch
 
 
+def _vsync_rising_edges(
+    falling: npt.NDArray, prev_falling: npt.NDArray, width: float, low: float
+) -> npt.NDArray[np.float64]:
+    """Rising edges of frames with falling edges `falling`, given each frame's previous falling
+    edge, the median pulse width and the low phase (rising - previous falling:
+    `VSYNC_LOW_WIDTH_PERCENTILE`).
+
+    The line has a pulse of fixed width before each falling edge, unless the frame is shorter
+    than width + low: then the low phase after the previous falling edge stays the same and the
+    pulse is shorter. So rising = max(falling - width, previous falling + low), and always
+    strictly between the previous falling edge and this one (midpoint if a frame is shorter
+    than the low phase), so that rising and falling edges alternate.
+    """
+    f = np.asarray(falling, dtype=float)
+    p = np.asarray(prev_falling, dtype=float)
+    r = np.fmax(f - width, p + low)  # fmax: no low phase measured (nan) -> falling - width
+    bad = ~((r > p) & (r < f))
+    r[bad] = np.where(np.isfinite(p[bad]), (p[bad] + f[bad]) / 2, f[bad] - width)
+    return r
+
+
 def _rising_edges_by_line_state(
     spans: list[SpanPatch], rising: npt.NDArray, falling: npt.NDArray
 ) -> list[SpanPatch]:
     """Make vsync rising edges alternate with falling edges at the bounds of reconstructed
     spans.
 
-    Reconstructed rising edges are placed at falling - pulse width for the frames whose falling
+    Reconstructed rising edges are placed by `_vsync_rising_edges` for the frames whose falling
     edge is in the span. With a pulse of most of a period (~15.9 ms of 16.7 ms on real files) a
     frame's rising edge sits just after the previous frame's falling edge, so at a bound it can
     be on the other side of the span from its falling edge. Decided by line state, not time
@@ -2549,7 +2589,7 @@ def _rising_edges_by_line_state(
     - start: if a measured rising edge follows the last measured falling edge before the span,
       the first reconstructed frame's rising edge was measured: drop the reconstructed one
     - end: if no measured rising edge lies between the span and the first measured falling
-      edge after it, that frame's rising edge was in the span: add it at falling - width
+      edge after it, that frame's rising edge was in the span: add it (`_vsync_rising_edges`)
     """
     bounds = [s.span for s in spans]
     kept_r = np.sort(rising[~in_intervals(rising, bounds)])
@@ -2574,9 +2614,10 @@ def _rising_edges_by_line_state(
             next_f = kept_f[k]
             between = any(b[0] < next_f and b[1] > z for b in bounds if b != s.span)
             if not between and not ((kept_r > f[-1]) & (kept_r < next_f)).any():
-                t = next_f - width
-                if t <= f[-1]:
-                    t = (f[-1] + next_f) / 2
+                low = s.diagnostics.get("low_width_sec", np.nan)
+                t = _vsync_rising_edges(
+                    np.r_[next_f], np.r_[f[-1]], width, np.nan if low is None else low
+                )[0]
                 r = np.r_[r, t]
                 changes.append(
                     "rising edge of the first measured frame after the span: added"
