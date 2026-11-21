@@ -2228,11 +2228,19 @@ def build_sync_patch(
                 ~in_intervals(in_block_r[ok], gap_spans_)
                 & ~in_intervals(vf_all[j[ok]], gap_spans_)
             ]
-            low = float(np.percentile(lows, VSYNC_LOW_WIDTH_PERCENTILE)) if len(lows) else np.nan
+            low = (
+                float(np.percentile(lows, VSYNC_LOW_WIDTH_PERCENTILE))
+                if len(lows)
+                else np.nan
+            )
             for g in rec.gaps:
                 idx = np.arange(g.frame_before + 1, g.frame_before + 1 + g.n_frames)
                 fall = rec.times[idx]
-                prev = rec.times[idx - 1] if g.frame_before >= 0 else np.r_[-np.inf, fall[:-1]]
+                prev = (
+                    rec.times[idx - 1]
+                    if g.frame_before >= 0
+                    else np.r_[-np.inf, fall[:-1]]
+                )
                 vsync_spans.append(
                     SpanPatch(
                         g.span,
@@ -2568,7 +2576,9 @@ def _vsync_rising_edges(
     """
     f = np.asarray(falling, dtype=float)
     p = np.asarray(prev_falling, dtype=float)
-    r = np.fmax(f - width, p + low)  # fmax: no low phase measured (nan) -> falling - width
+    r = np.fmax(
+        f - width, p + low
+    )  # fmax: no low phase measured (nan) -> falling - width
     bad = ~((r > p) & (r < f))
     r[bad] = np.where(np.isfinite(p[bad]), (p[bad] + f[bad]) / 2, f[bad] - width)
     return r
