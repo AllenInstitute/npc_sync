@@ -953,16 +953,47 @@ DIODE_EDGE_CLASSES = {
 """Classes of photodiode edges in a box-1 block (`align_diode_toggles`):
 
 - toggle: frame k's toggle edge
-- glitch: comparator chatter, consecutive edges < `DIODE_GLITCH_MAX_SEC` apart. Not a display
-  change: the display changes at most once per refresh.
+- glitch: comparator chatter. Not a display change: the display changes at most once per
+  refresh. Either consecutive edges < `DIODE_GLITCH_PREFILTER_MAX_SEC` apart (set aside before
+  the alignment), or a state-restoring pulse shorter than `DIODE_GLITCH_MAX_SEC` between the
+  matched toggles of two consecutive frames (found after it).
 - phantom_flicker: state-restoring pairs strictly between the toggles of frame k and k+1, where
   frame k is held for n >= 3 refreshes, at most n - 1 edges (one per missed refresh)
 - unexplained: any other edge between the first and last matched toggles
 - outside: before the first or after the last matched toggle (e.g. the screen returning to grey)
 """
 
-DIODE_GLITCH_MAX_SEC = 0.05 / 59.95
-"""Same threshold as npc_stim's `DEFINITE_SHORT_INTERVAL_THRESHOLD` (0.83 ms)."""
+DIODE_GLITCH_PREFILTER_MAX_SEC = 0.05 / 59.95
+"""Consecutive edges closer than this (0.83 ms) are set aside before the alignment
+(`diode_glitch_mask`), which can't use the frames yet. Same value as npc_stim's
+`DEFINITE_SHORT_INTERVAL_THRESHOLD`; kept, so that the alignment of blocks that were already
+explained doesn't change. It is below every real state of an explained block (>= 2.18 ms, see
+`DIODE_GLITCH_MAX_SEC`). In blocks with a failing diode, real states get this short (0.84 ms in
+DRpilot_706401_20240422/23): if one is removed here its two frames have no toggle, and the block
+is rejected."""
+DIODE_GLITCH_MAX_SEC = 0.1 / 59.95
+"""Longest comparator-chatter pulse (1.67 ms, a tenth of a refresh): a state-restoring pulse
+shorter than this, between the matched toggles of two consecutive frames, is a glitch
+(`align_diode_toggles` step 5). Two conditions, both needed:
+
+- (i) it is shorter than any real state of the line. Measured on the 1,075 aligned box-1 blocks
+  of 222 sessions (npc_sync experiments/glitch-width): chatter pulses in frames of 1-2
+  refreshes are <= 0.24 ms in the 1,064 explained blocks (286 pulses) and <= 1.21 ms in the two
+  blocks whose diode signal degrades late in the task (DRpilot_702136_20240306,
+  DRpilot_708016_20240501: 942 pulses, 3 of them above 0.83 ms). The shortest interval between
+  the toggles of consecutive frames is 2.18 ms in 72.4 M intervals of the explained blocks
+  (about 550 below 3 ms, in blocks whose threshold is at the edge of the signal). The threshold
+  is at the geometric centre of that gap (1.21 - 2.18 ms).
+- (ii) the frames on both sides have their toggles (matched within
+  `DIODE_TOGGLE_MATCH_TOL_SEC`, or in the second pass) and are consecutive, so no frame's toggle
+  is among the removed edges and removing them can't change any frame's assignment. In the 9
+  blocks with a broken diode, 4 of the 9,720 groups of unexplained edges meet this (their
+  pulses are 11.6 - 24.8 ms long), and the one pulse shorter than the threshold does not.
+
+Width alone doesn't tell chatter from display content: phantom flicker below the full amplitude
+gives TTL pulses of 0.2 - 8.5 ms inside holds of >= 3 refreshes (classified by the hold).
+Changing this value can't change a block that is already explained: it applies only to edges
+that would otherwise be unexplained."""
 HELD_FRAME_MIN_REFRESHES = 1.5
 """A stim frame interval at least this many refreshes long is a held (dropped) frame."""
 DIODE_OFF_GRID_FRACTION = 0.1
@@ -1024,7 +1055,8 @@ class DiodeToggleAlignment:
     """Per edge: `DIODE_EDGE_CLASSES` key."""
     edge_frame: npt.NDArray[np.intp]
     """Per edge: the frame whose toggle it is (toggle), the held frame whose hold it is in
-    (phantom flicker), the frame before it (unexplained), else -1."""
+    (phantom flicker), the frame before it (unexplained, and glitches found after the
+    alignment), else -1."""
     frame_edge: npt.NDArray[np.intp]
     """Per frame: index of its toggle edge, or -1."""
     frame_rising: npt.NDArray[np.bool_]
@@ -1120,11 +1152,72 @@ class DiodeToggleAlignment:
                 if np.isfinite(self.residual).any()
                 else None
             ),
+            "glitch_between_matched_toggles": self.n_glitch_between_matched_toggles,
+            "toggle_latency": self.toggle_latency_summary(),
         }
+
+    @property
+    def toggle_latency(self) -> npt.NDArray[np.float64]:
+        """Per frame: measured toggle edge - frame time (vsync falling edge), seconds (NaN if
+        the frame has no toggle edge)."""
+        if len(self._frame_times) != len(self.frame_edge):
+            return np.full(len(self.frame_edge), np.nan)
+        return np.where(
+            self.frame_edge >= 0,
+            self.edge_times[np.clip(self.frame_edge, 0, None)] - self._frame_times,
+            np.nan,
+        )
+
+    def toggle_latency_summary(self) -> dict[str, Any]:
+        """Distribution of `toggle_latency` over the block's frames: what the photodiode says
+        about `vsync + constant lag` display times (stored in `DiodeBlockPatch.diagnostics`).
+
+        - 'rising_ms', 'falling_ms': percentiles (p1, p50, p99) of the latency, by toggle
+          polarity (the TTL threshold makes falling edges ~3-5 ms later than rising ones)
+        - 'abs_deviation_ms': percentiles (p50, p99, p99.9) and max of |latency - median
+          latency of its polarity|: how far single frames are from a constant lag
+        - 'n_deviation_over_half_refresh': frames whose latency is more than half a refresh
+          from the median of its polarity (e.g. a late frame-signal falling edge: the frame was
+          displayed on time, and `vsync + constant lag` is late for it)
+        - 'n_toggles', 'n_frames'
+        """
+        lat = self.toggle_latency
+        ok = np.isfinite(lat)
+        out: dict[str, Any] = {
+            "n_frames": len(lat),
+            "n_toggles": int(ok.sum()),
+            "rising_ms": None,
+            "falling_ms": None,
+            "abs_deviation_ms": None,
+            "n_deviation_over_half_refresh": None,
+        }
+        if not ok.any():
+            return out
+        dev = np.full(len(lat), np.nan)
+        for key, pol in (("rising_ms", True), ("falling_ms", False)):
+            sel = ok & (self.frame_rising == pol)
+            if not sel.any():
+                continue
+            p = np.percentile(lat[sel], [1, 50, 99]) * 1e3
+            out[key] = {"p1": float(p[0]), "p50": float(p[1]), "p99": float(p[2])}
+            dev[sel] = np.abs(lat[sel] - np.median(lat[sel]))
+        d = dev[np.isfinite(dev)]
+        p = np.percentile(d, [50, 99, 99.9]) * 1e3
+        out["abs_deviation_ms"] = {
+            "p50": float(p[0]),
+            "p99": float(p[1]),
+            "p99.9": float(p[2]),
+            "max": float(d.max() * 1e3),
+        }
+        out["n_deviation_over_half_refresh"] = int((d > self.refresh_sec / 2).sum())
+        return out
 
     _frame_times: npt.NDArray[np.float64] = dataclasses.field(
         default_factory=lambda: np.array([]), repr=False
     )
+    n_glitch_between_matched_toggles: int = 0
+    """Glitch edges found after the alignment (`DIODE_GLITCH_MAX_SEC`); the other glitch edges
+    were set aside before it (`DIODE_GLITCH_PREFILTER_MAX_SEC`)."""
 
 
 def _nanmedian_ms(x: npt.NDArray, mask: npt.NDArray) -> float | None:
@@ -1133,7 +1226,7 @@ def _nanmedian_ms(x: npt.NDArray, mask: npt.NDArray) -> float | None:
 
 
 def diode_glitch_mask(
-    edge_times: npt.ArrayLike, max_sec: float = DIODE_GLITCH_MAX_SEC
+    edge_times: npt.ArrayLike, max_sec: float = DIODE_GLITCH_PREFILTER_MAX_SEC
 ) -> npt.NDArray[np.bool_]:
     """Edges to remove as comparator chatter: clusters of consecutive edges less than `max_sec`
     apart. An even cluster is removed whole (a pulse); an odd cluster keeps its last edge (a
@@ -1337,7 +1430,8 @@ def align_diode_toggles(
     """Align the photodiode edges of one box-1 block (diodeBoxFrameInterval = 1) with its
     frames, and classify every edge (`DIODE_EDGE_CLASSES`).
 
-    1. Comparator glitches (consecutive edges < `DIODE_GLITCH_MAX_SEC` apart) are set aside.
+    1. Comparator glitches (consecutive edges < `DIODE_GLITCH_PREFILTER_MAX_SEC` apart) are
+       set aside.
     2. Frame <-> edge offset from landmarks (`_diode_landmarks`): with box interval 1 it can't be
        found from regular frames (v[k] + L ~ v[k+1] + L - R). Raises `DiodeOffsetUndetermined`
        if there are fewer than 3 consistent landmarks.
@@ -1347,7 +1441,11 @@ def align_diode_toggles(
        frame-signal rising edge + `DIODE_MIN_DISPLAY_AFTER_RISE_SEC` (a late frame-signal
        falling edge: the frame is displayed on time, see `DIODE_OFF_GRID_FRACTION`).
     5. Edges between the toggles of frames k and k+1 are phantom flicker if frame k is held for
-       n >= 3 refreshes and they are an even number <= n - 1; otherwise unexplained.
+       n >= 3 refreshes and they are an even number <= n - 1. Otherwise, state-restoring pulses
+       among them shorter than `DIODE_GLITCH_MAX_SEC` are glitches (the display can't change
+       and change back within a frame, and both frames have their toggle), if that leaves
+       nothing, or phantom flicker by the same rule. Anything else is unexplained, as is every
+       edge between the toggles of frames that aren't consecutive.
     6. Long-interval check (`DiodeToggleAlignment.long_interval_mismatch`).
 
     Parameters
@@ -1437,6 +1535,7 @@ def align_diode_toggles(
     ef = np.full(M, -1, np.intp)
     cls[fe[m]] = DIODE_TOGGLE
     ef[fe[m]] = m
+    n_late_glitch = 0
     if len(m):
         cls[: fe[m[0]]] = DIODE_OUTSIDE
         cls[fe[m[-1]] + 1 :] = DIODE_OUTSIDE
@@ -1444,13 +1543,21 @@ def align_diode_toggles(
             ka, kb = m[g], m[g + 1]
             between = np.arange(fe[ka] + 1, fe[kb])
             ef[between] = ka
-            if (
-                kb == ka + 1
-                and nref[ka] >= 3
-                and len(between) <= nref[ka] - 1
-                and len(between) % 2 == 0
-            ):
+            if kb != ka + 1:
+                continue
+
+            def is_flicker(n_edges: int) -> bool:
+                return nref[ka] >= 3 and n_edges <= nref[ka] - 1 and n_edges % 2 == 0
+
+            if is_flicker(len(between)):
                 cls[between] = DIODE_PHANTOM_FLICKER
+                continue
+            chatter = diode_glitch_mask(e[between], DIODE_GLITCH_MAX_SEC)
+            rest = between[~chatter]
+            if chatter.any() and (len(rest) == 0 or is_flicker(len(rest))):
+                cls[between[chatter]] = DIODE_GLITCH
+                cls[rest] = DIODE_PHANTOM_FLICKER
+                n_late_glitch += int(chatter.sum())
     else:
         cls[:] = DIODE_OUTSIDE
     # long-interval check on latency-corrected toggle-to-toggle intervals
@@ -1490,6 +1597,7 @@ def align_diode_toggles(
         n_landmarks_disagree=n_dis,
         long_interval_mismatch=long_mismatch,
         _frame_times=v,
+        n_glitch_between_matched_toggles=n_late_glitch,
     )
 
 
@@ -1736,6 +1844,148 @@ class DiodeBlockPatch:
         return cls(
             **{k: d[k] for k in d if k in {f.name for f in dataclasses.fields(cls)}}
         )
+
+
+DIODE_VERIFY_RISING_LATENCY_SEC = 0.01955
+"""Typical time from a frame's vsync falling edge to its rising photodiode edge: the part of
+npc_stim's constant monitor lag that the photodiode measures (npc_stim
+`AVERAGE_VSYNC_TO_DIODE_FLIP_TIME`; the constant lag adds 8 ms for the screen centre)."""
+DIODE_VERIFY_MAX_RISING_LATENCY_DIFF_SEC = 0.25 / 59.95
+"""`verify_constant_lag`: max |median rising toggle latency - `DIODE_VERIFY_RISING_LATENCY_SEC`|.
+The 1,066 cleaned box-1 blocks surveyed are within 3.3 ms; a display one frame late is
+16.7 ms off (npc_sync experiments/glitch-width)."""
+DIODE_VERIFY_MAX_ABS_DEVIATION_P99_SEC = 0.5 / 59.95
+"""`verify_constant_lag`: max 99th percentile of |toggle latency - median of its polarity|
+(surveyed cleaned blocks: median 0.71 ms, p99 5.2 ms, max 9.6 ms)."""
+DIODE_VERIFY_MAX_FRACTION_OVER_HALF_REFRESH = 0.001
+"""`verify_constant_lag`: max fraction of frames whose toggle latency is more than half a
+refresh from the median of its polarity (the p99 of the surveyed cleaned blocks)."""
+
+
+@dataclasses.dataclass(frozen=True)
+class DiodeVerification:
+    """Result of `verify_constant_lag`: do a block's photodiode toggles, as aligned to its
+    frames for the `SyncPatch`, confirm display times of vsync + a constant lag?"""
+
+    passed: bool
+    reason: str
+    """Why it didn't pass ('' if it did)."""
+    status: str | None = None
+    """`DiodeBlockPatch.status` (None: no record for the block)."""
+    n_frames: int | None = None
+    n_toggles: int | None = None
+    landmarks: int | None = None
+    landmarks_disagree: int | None = None
+    unobserved_frames: int | None = None
+    rising_latency_p50_ms: float | None = None
+    abs_deviation_p99_ms: float | None = None
+    fraction_over_half_refresh: float | None = None
+
+    @property
+    def summary(self) -> str:
+        """One line, for logs and notes."""
+        if self.passed:
+            assert self.fraction_over_half_refresh is not None
+            return (
+                "photodiode verification passed: every diode edge explained, "
+                f"{self.n_toggles} of {self.n_frames} frames with a toggle, "
+                f"{self.landmarks} landmarks (0 disagreeing), median rising latency "
+                f"{self.rising_latency_p50_ms:.2f} ms, abs deviation p99 "
+                f"{self.abs_deviation_p99_ms:.2f} ms, "
+                f"{self.fraction_over_half_refresh:.3%} of frames over half a refresh off"
+            )
+        return f"photodiode verification failed: {self.reason}"
+
+    def to_dict(self) -> dict[str, Any]:
+        return _jsonable(dataclasses.asdict(self) | {"summary": self.summary})
+
+
+def verify_constant_lag(block: DiodeBlockPatch | None) -> DiodeVerification:
+    """Whether a block's photodiode record verifies display times of vsync + constant lag
+    (for a block whose display times can't be estimated from the photodiode by npc_stim, and
+    can't be checked another way). All of:
+
+    1. `status == 'cleaned'`: every diode edge is a frame's toggle, phantom flicker or a
+       glitch; every frame but the first/last has a toggle; the frame <-> edge offset is
+       fixed by held frames (landmarks).
+    2. no disagreeing landmark, and no frame inside a replayed sync interval (unobserved).
+    3. from `diagnostics['toggle_latency']` (measured toggle - vsync falling edge, per frame):
+       - the median for rising toggles is within `DIODE_VERIFY_MAX_RISING_LATENCY_DIFF_SEC`
+         (a quarter refresh) of `DIODE_VERIFY_RISING_LATENCY_SEC`: the lag is the usual one;
+       - the 99th percentile of |latency - median of its polarity| is at most
+         `DIODE_VERIFY_MAX_ABS_DEVIATION_P99_SEC` (half a refresh): the lag is constant;
+       - at most `DIODE_VERIFY_MAX_FRACTION_OVER_HALF_REFRESH` of the frames are more than
+         half a refresh from the median of their polarity.
+
+    A record without `toggle_latency` (patch built with npc_sync <= 0.3.10) doesn't pass.
+    Thresholds: npc_sync experiments/glitch-width (1,066 cleaned box-1 blocks).
+
+    >>> verify_constant_lag(None).reason
+    'no photodiode record for the block in the sync patch'
+    >>> verify_constant_lag(DiodeBlockPatch(0, 0.0, 1.0, 'rejected', reason='x')).reason
+    "photodiode edges are 'rejected' in the sync patch: x"
+    """
+    if block is None:
+        return DiodeVerification(
+            False, "no photodiode record for the block in the sync patch"
+        )
+    d = block.diagnostics or {}
+    lat = d.get("toggle_latency") or {}
+    rising = (lat.get("rising_ms") or {}).get("p50")
+    deviation = (lat.get("abs_deviation_ms") or {}).get("p99")
+    n_toggles = lat.get("n_toggles")
+    n_over = lat.get("n_deviation_over_half_refresh")
+    fraction = n_over / n_toggles if n_toggles and n_over is not None else None
+    values: dict[str, Any] = dict(
+        status=block.status,
+        n_frames=lat.get("n_frames"),
+        n_toggles=n_toggles,
+        landmarks=d.get("landmarks"),
+        landmarks_disagree=d.get("landmarks_disagree"),
+        unobserved_frames=d.get("unobserved_frames"),
+        rising_latency_p50_ms=rising,
+        abs_deviation_p99_ms=deviation,
+        fraction_over_half_refresh=fraction,
+    )
+    reasons = []
+    if block.status != "cleaned":
+        reasons.append(
+            f"photodiode edges are {block.status!r} in the sync patch"
+            + (f": {block.reason}" if block.reason else "")
+        )
+    elif rising is None or deviation is None or fraction is None:
+        reasons.append(
+            "no toggle latencies in the sync patch's photodiode record "
+            "(patch built with an older npc_sync)"
+        )
+    else:
+        if d.get("landmarks_disagree") != 0:
+            reasons.append(
+                f"{d.get('landmarks_disagree')} held-frame landmark(s) disagree on the "
+                "frame <-> diode edge offset"
+            )
+        if d.get("unobserved_frames") != 0:
+            reasons.append(
+                f"{d.get('unobserved_frames')} frame(s) inside a replayed sync interval"
+            )
+        diff = abs(rising - DIODE_VERIFY_RISING_LATENCY_SEC * 1e3)
+        if diff > DIODE_VERIFY_MAX_RISING_LATENCY_DIFF_SEC * 1e3:
+            reasons.append(
+                f"median rising toggle latency {rising:.2f} ms is {diff:.2f} ms from "
+                f"{DIODE_VERIFY_RISING_LATENCY_SEC * 1e3:.2f} ms "
+                f"(> {DIODE_VERIFY_MAX_RISING_LATENCY_DIFF_SEC * 1e3:.1f} ms)"
+            )
+        if deviation > DIODE_VERIFY_MAX_ABS_DEVIATION_P99_SEC * 1e3:
+            reasons.append(
+                f"toggle latency abs deviation p99 {deviation:.2f} ms "
+                f"(> {DIODE_VERIFY_MAX_ABS_DEVIATION_P99_SEC * 1e3:.1f} ms)"
+            )
+        if fraction > DIODE_VERIFY_MAX_FRACTION_OVER_HALF_REFRESH:
+            reasons.append(
+                f"{fraction:.3%} of frames have a toggle more than half a refresh from the "
+                f"median (> {DIODE_VERIFY_MAX_FRACTION_OVER_HALF_REFRESH:.1%})"
+            )
+    return DiodeVerification(passed=not reasons, reason="; ".join(reasons), **values)
 
 
 @dataclasses.dataclass

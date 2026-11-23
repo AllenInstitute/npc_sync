@@ -330,3 +330,179 @@ def test_predict_diode_edges_ignores_copies_of_other_spans() -> None:
     assert any("wrong polarity" in x for x in old.failures())
     _, _, new = P.predict_diode_edges(ft, r, f, s1, 3, exclude=[s2])
     assert new.failures() == []
+
+
+# --- comparator chatter between matched toggles (npc_sync experiments/glitch-width) ---------
+
+
+@pytest.mark.parametrize(
+    ("width", "is_glitch"),
+    [
+        (0.00091, True),  # DRpilot_702136_20240306
+        (0.00121, True),  # DRpilot_708016_20240501: the widest chatter pulse surveyed
+        (0.0015, True),
+        (0.0018, False),  # above DIODE_GLITCH_MAX_SEC (1.67 ms)
+        (0.00218, False),  # the shortest real state surveyed
+    ],
+)
+def test_short_pulse_between_matched_toggles_is_a_glitch(width: float, is_glitch: bool) -> None:
+    """A state-restoring pulse 1.1 ms after the toggle of a regular frame, wider than the
+    0.83 ms set aside before the alignment: a glitch if shorter than `DIODE_GLITCH_MAX_SEC`,
+    since the frames on both sides have their toggles."""
+    k = 900  # rising toggle, 1-refresh frame
+    fi, display, fall, rise, clean_edges = _box1()
+    ref, e_ref, _ = _align(fi, fall, rise, clean_edges)
+    t0 = display[k] + LAT_R + 0.0011
+    _, _, _, _, edges = _box1(extra_edges=(t0, t0 + width))
+    al, e, q = _align(fi, fall, rise, edges)
+    pulse = np.flatnonzero((e > t0 - 1e-5) & (e < t0 + width + 1e-5))
+    assert len(pulse) == 2
+    if is_glitch:
+        assert (al.edge_class[pulse] == P.DIODE_GLITCH).all()
+        assert al.n_glitch_between_matched_toggles == 2
+        assert al.summary()["glitch_between_matched_toggles"] == 2
+        assert al.failures() == []
+        assert set(pulse.tolist()) <= set(al.removable.tolist())
+        assert (al.edge_frame[pulse] == k).all()
+    else:
+        assert (al.edge_class[pulse] == P.DIODE_UNEXPLAINED).all()
+        assert al.n_glitch_between_matched_toggles == 0
+        assert al.failures()
+    # no frame's toggle changes either way
+    assert np.array_equal(e[al.frame_edge], e_ref[ref.frame_edge])
+
+
+def test_short_pulse_next_to_a_frame_without_a_toggle_stays_unexplained() -> None:
+    """Condition (ii): with the next frame's toggle missing, the pulse isn't between the toggles
+    of two consecutive frames, so it could be (part of) that frame's toggle."""
+    k = 900
+    fi, display, fall, rise, edges = _box1()
+    t0 = display[k] + LAT_R + 0.004
+    _, _, _, _, edges = _box1(extra_edges=(t0, t0 + 0.001))
+    _, e, q = _align(fi, fall, rise, edges)
+    drop = np.argmin(np.abs(e - (display[k + 1] + LAT_F)))  # frame k + 1's toggle
+    e, q = np.delete(e, drop), np.delete(q, drop)
+    pulse = np.flatnonzero((e > t0 - 1e-5) & (e < t0 + 0.001 + 1e-5))
+    al = P.align_diode_toggles(fall, fi, e, q)
+    assert (al.edge_class[pulse] == P.DIODE_UNEXPLAINED).all()
+    assert k + 1 in set(al.missing_frames.tolist())
+    assert al.n_glitch_between_matched_toggles == 0
+    assert len(al.failures()) == 2
+    # with the frame-signal rising edges, the pulse's first edge is in the window of the second
+    # pass and is taken as frame k + 1's toggle: the other edge has no explanation
+    al = P.align_diode_toggles(fall, fi, e, q, frame_signal_rising=rise)
+    assert al.edge_class[pulse].tolist() == [P.DIODE_TOGGLE, P.DIODE_UNEXPLAINED]
+    assert not set(pulse.tolist()) & set(al.removable.tolist())
+    assert al.failures()
+
+
+def test_chatter_and_phantom_flicker_in_the_same_hold() -> None:
+    """A 1 ms chatter pulse and a phantom-flicker pair in a 3-refresh hold: 4 edges, more than
+    the n - 1 = 2 that flicker explains; without the chatter pulse the rest is flicker."""
+    k = 700  # 3-refresh hold, rising toggle
+    fi, display, fall, rise, _ = _box1()
+    t0 = display[k] + LAT_R + 0.004
+    _, _, _, _, edges = _box1(phantom_pairs={k: [1]}, extra_edges=(t0, t0 + 0.001))
+    al, e, q = _align(fi, fall, rise, edges)
+    assert al.failures() == []
+    assert al.count(P.DIODE_GLITCH) == 2 and al.n_glitch_between_matched_toggles == 2
+    assert al.count(P.DIODE_PHANTOM_FLICKER) == 2
+    assert (al.edge_frame[al.edge_class == P.DIODE_PHANTOM_FLICKER] == k).all()
+    # a pulse too long for chatter, with the flicker pair: 4 edges, not explained
+    _, _, _, _, edges = _box1(phantom_pairs={k: [1]}, extra_edges=(t0, t0 + 0.003))
+    al = _align(fi, fall, rise, edges)[0]
+    assert al.failures() and al.count(P.DIODE_UNEXPLAINED) == 4
+
+
+def test_patch_removes_chatter_between_matched_toggles(tmp_path) -> None:
+    k = 900
+    fi, display, fall, rise, _ = _box1()
+    t0 = display[k] + LAT_R + 0.0011
+    _, _, _, _, edges = _box1(extra_edges=(t0, t0 + 0.00121))
+    t, s = _events(edges)
+    path = _write(tmp_path / "chatter.h5", t, s)
+    raw = npc_sync.SyncDataset(path)
+    patch = P.build_sync_patch(raw, [P.StimBlock(0, fi, 1, "synthetic")], builder="test")
+    (rec,) = patch.diode_blocks
+    assert rec.status == "cleaned" and rec.n_glitch == 2
+    assert rec.diagnostics["glitch_between_matched_toggles"] == 2
+    e, q = _diode(npc_sync.SyncDataset(path, patch=P.SyncPatch.from_json(patch.to_json())))
+    assert len(e) == len(display)  # one edge per frame
+    assert (np.diff(q.astype(int)) != 0).all()
+    assert np.max(np.abs(e - np.where(q, LAT_R, LAT_F) - display)) < 0.2e-3
+
+
+def test_toggle_latency_summary(flicker_file) -> None:
+    """Per-frame toggle - vsync, stored in the block's diagnostics: what the diode says about
+    `vsync + constant lag`. A late frame-signal falling edge (frame displayed on time) is one
+    frame more than half a refresh from the block's latency."""
+    fi, display, fall, rise, edges = _box1(late_returns={1200: 0.014})
+    al, e, q = _align(fi, fall, rise, edges)
+    lat = al.toggle_latency
+    assert np.isfinite(lat).all()
+    assert np.allclose(lat, e[al.frame_edge] - fall)
+    s = al.toggle_latency_summary()
+    assert s["n_toggles"] == s["n_frames"] == len(fall)
+    # `fall` is 0.2 ms after the refresh in `_box1`
+    assert s["rising_ms"]["p50"] == pytest.approx(LAT_R * 1e3 - 0.2, abs=0.1)
+    assert s["falling_ms"]["p50"] == pytest.approx(LAT_F * 1e3 - 0.2, abs=0.1)
+    assert s["abs_deviation_ms"]["p99"] < 0.2
+    assert s["abs_deviation_ms"]["max"] == pytest.approx(14.0, abs=0.2)
+    assert s["n_deviation_over_half_refresh"] == 1
+    # stored with the patch, and a patch saved without it (npc_sync <= 0.3.10) still loads
+    raw = npc_sync.SyncDataset(flicker_file["path"])
+    patch = P.build_sync_patch(raw, [P.StimBlock(0, flicker_file["fi"], 1, "synthetic")], builder="test")
+    d = patch.to_dict()
+    stored = d["diode_blocks"][0]["diagnostics"]
+    assert stored["toggle_latency"]["n_deviation_over_half_refresh"] == 0
+    assert stored["toggle_latency"]["rising_ms"]["p50"] == pytest.approx(LAT_R * 1e3 - 0.2, abs=0.1)
+    for key in ("toggle_latency", "glitch_between_matched_toggles"):
+        stored.pop(key)
+    old = P.SyncPatch.from_dict(d)
+    assert old.diode_blocks[0].status == "cleaned"
+    assert "toggle_latency" not in old.diode_blocks[0].diagnostics
+
+
+def test_verify_constant_lag(flicker_file) -> None:
+    """A cleaned block with the usual, constant toggle latency verifies vsync + constant lag;
+    a record without toggle latencies (older npc_sync), a rejected block, or a latency a frame
+    off doesn't."""
+    raw = npc_sync.SyncDataset(flicker_file["path"])
+    patch = P.build_sync_patch(raw, [P.StimBlock(0, flicker_file["fi"], 1, "synthetic")], builder="test")
+    (rec,) = patch.diode_blocks
+    v = P.verify_constant_lag(rec)
+    assert v.passed and v.reason == "" and v.status == "cleaned"
+    assert v.rising_latency_p50_ms == pytest.approx(LAT_R * 1e3 - 0.2, abs=0.1)
+    assert v.summary.startswith("photodiode verification passed") and "\n" not in v.summary
+    assert v.to_dict()["passed"] is True
+    # same after a save/load round trip
+    loaded = P.SyncPatch.from_json(patch.to_json()).diode_blocks[0]
+    assert P.verify_constant_lag(loaded) == v
+
+    assert not P.verify_constant_lag(None).passed
+    old = P.DiodeBlockPatch.from_dict(
+        rec.to_dict() | {"diagnostics": {k: x for k, x in rec.diagnostics.items() if k != "toggle_latency"}}
+    )
+    assert "older npc_sync" in P.verify_constant_lag(old).reason
+    rejected = P.DiodeBlockPatch.from_dict(rec.to_dict() | {"status": "rejected", "reason": "2 unexplained"})
+    assert "rejected" in P.verify_constant_lag(rejected).reason
+
+    def with_latency(**changes) -> P.DiodeBlockPatch:
+        d = rec.to_dict()
+        lat = d["diagnostics"]["toggle_latency"]
+        for key, value in changes.items():
+            if isinstance(value, dict):
+                lat[key] = lat[key] | value
+            else:
+                lat[key] = value
+        return P.DiodeBlockPatch.from_dict(d)
+
+    late = P.verify_constant_lag(with_latency(rising_ms={"p50": LAT_R * 1e3 + 16.7}))
+    assert not late.passed and "median rising toggle latency" in late.reason
+    jitter = P.verify_constant_lag(with_latency(abs_deviation_ms={"p99": 9.0}))
+    assert not jitter.passed and "abs deviation p99" in jitter.reason
+    many = P.verify_constant_lag(with_latency(n_deviation_over_half_refresh=40))
+    assert not many.passed and "half a refresh" in many.reason
+    d = rec.to_dict()
+    d["diagnostics"]["landmarks_disagree"] = 1
+    assert "landmark" in P.verify_constant_lag(P.DiodeBlockPatch.from_dict(d)).reason
